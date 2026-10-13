@@ -103,6 +103,19 @@ func TestPageHasTheContainerList(t *testing.T) {
 	}
 }
 
+func TestPageChipsAndLastCheckedAreAccessible(t *testing.T) {
+	page := string(indexHTML)
+	for _, want := range []string{
+		`setAttribute('aria-label', (key ? CLABELS[key] : 'All') + ': ' + (counts[key] || 0))`,
+		`cell(tr, rel(c.checked_at)).title = when(c.checked_at)`,
+		`gap:6px`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html lacks %s", want)
+		}
+	}
+}
+
 func scanHandler(res ScanResult) (http.Handler, *int) {
 	calls := 0
 	return Handler(testSnap, func() ScanResult { calls++; return res }), &calls

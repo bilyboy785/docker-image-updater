@@ -48,7 +48,7 @@ type ContainerStatus struct {
 	ImageID   string    `json:"image_id"` // short (12 hex)
 	Status    string    `json:"status"`
 	Detail    string    `json:"detail"`
-	Policy    string    `json:"policy"` // "auto" or "notify"
+	Policy    string    `json:"policy"` // "auto", "notify" or "invalid"
 	Window    string    `json:"window"` // raw window label, or ""
 	CheckedAt time.Time `json:"checked_at"`
 }
