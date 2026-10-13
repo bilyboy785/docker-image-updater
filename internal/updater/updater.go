@@ -163,7 +163,6 @@ func (u *Updater) publishReport() {
 // RunOnce performs one full scan.
 func (u *Updater) RunOnce(ctx context.Context) error {
 	start := time.Now()
-	u.touch()
 	u.report = map[string]stats.ContainerStatus{}
 	lctx, lcancel := context.WithTimeout(ctx, u.apiTimeout)
 	containers, err := u.docker.ListContainers(lctx)
@@ -171,6 +170,7 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list containers: %w", err)
 	}
+	u.touch() // only a scan that can reach the daemon makes progress
 	groups := map[string][]docker.Container{}
 	var refs []string
 	watched, skipped := 0, 0

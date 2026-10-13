@@ -200,3 +200,15 @@ func TestCheckHealthIgnoresProxyEnvironment(t *testing.T) {
 		t.Fatalf("the probe client must not use a proxy: %#v", healthClient().Transport)
 	}
 }
+
+func TestHealthzOnlyFailedScansGoesStale(t *testing.T) {
+	// The daemon is unreachable: no scan completes and the heartbeat is never touched.
+	start := time.Unix(1_000_000, 0)
+	snap := stats.Snapshot{StartedAt: start, Scans: 5, LastScan: start.Add(-time.Hour), LastScanMs: 1000}
+	if rec := healthAt(t, snap, start.Add(hLimit)); rec.Code != 200 {
+		t.Fatalf("just inside: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := healthAt(t, snap, start.Add(hLimit+time.Second)); rec.Code != 503 {
+		t.Fatalf("just outside: %d %q", rec.Code, rec.Body.String())
+	}
+}
