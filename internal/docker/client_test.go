@@ -50,13 +50,89 @@ func TestInspectContainer(t *testing.T) {
 
 func TestPullImage(t *testing.T) {
 	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" || r.URL.Path != "/images/create" || r.URL.Query().Get("fromImage") != "nginx:latest" {
+		if r.Method != "POST" || r.URL.Path != "/images/create" || r.URL.Query().Get("fromImage") != "nginx" || r.URL.Query().Get("tag") != "latest" {
 			t.Errorf("unexpected %s %s", r.Method, r.URL)
 		}
 		w.Write([]byte(`{"status":"Pulling"}` + "\n" + `{"status":"Done"}` + "\n"))
 	})
 	if err := c.PullImage(context.Background(), "nginx:latest", ""); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The Engine API pulls every tag of a repository when no tag is given, so PullImage must always
+// send an explicit tag (or digest) and a fromImage without one.
+func TestPullImageAlwaysSendsOneTag(t *testing.T) {
+	for _, tc := range []struct{ ref, from, tag string }{
+		{"nginx", "nginx", "latest"},
+		{"nginx:1.25", "nginx", "1.25"},
+		{"ghcr.io/bakito/adguardhome-sync", "ghcr.io/bakito/adguardhome-sync", "latest"},
+		{"localhost:5005/app", "localhost:5005/app", "latest"},
+		{"localhost:5005/app:v1", "localhost:5005/app", "v1"},
+		{"registry.example.com:5000/a/b", "registry.example.com:5000/a/b", "latest"},
+		{"registry.example.com:5000/a/b:2", "registry.example.com:5000/a/b", "2"},
+		{"nginx@sha256:abc", "nginx", "sha256:abc"},
+		{"nginx:1@sha256:abc", "nginx", "sha256:abc"},
+	} {
+		var q map[string][]string
+		c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+			q = r.URL.Query()
+			w.Write([]byte(`{"status":"Done"}` + "\n"))
+		})
+		if err := c.PullImage(context.Background(), tc.ref, ""); err != nil {
+			t.Fatalf("%s: %v", tc.ref, err)
+		}
+		if len(q["fromImage"]) != 1 || q["fromImage"][0] != tc.from || len(q["tag"]) != 1 || q["tag"][0] != tc.tag {
+			t.Errorf("%s: fromImage=%v tag=%v, want %q and %q", tc.ref, q["fromImage"], q["tag"], tc.from, tc.tag)
+		}
+	}
+}
+
+func TestImageCallsKeepUntaggedReferences(t *testing.T) {
+	var paths []string
+	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Write([]byte(`{"Id":"sha256:9","Config":{}}`))
+	})
+	if _, err := c.ImageID(context.Background(), "localhost:5005/app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ImageConfig(context.Background(), "localhost:5005/app"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range paths {
+		if p != "/images/localhost:5005/app/json" {
+			t.Errorf("path %s", p)
+		}
+	}
+}
+
+func TestSplitRef(t *testing.T) {
+	for _, tc := range []struct{ ref, repo, tag string }{
+		{"nginx", "nginx", "latest"},
+		{"nginx:latest", "nginx", "latest"},
+		{"nginx:1.25-alpine", "nginx", "1.25-alpine"},
+		{"library/nginx", "library/nginx", "latest"},
+		{"ghcr.io/o/i", "ghcr.io/o/i", "latest"},
+		{"ghcr.io/o/i:1", "ghcr.io/o/i", "1"},
+		{"localhost:5005/app", "localhost:5005/app", "latest"},
+		{"localhost:5005/app:v1", "localhost:5005/app", "v1"},
+		{"registry.example.com:5000/a/b", "registry.example.com:5000/a/b", "latest"},
+		{"registry.example.com:5000/a/b/c:tag", "registry.example.com:5000/a/b/c", "tag"},
+		{"GHCR.IO/Org/Img", "GHCR.IO/Org/Img", "latest"},
+		{"GHCR.IO:443/Org/Img:T", "GHCR.IO:443/Org/Img", "T"},
+		{"[::1]:5000/x", "[::1]:5000/x", "latest"},
+		{"[::1]:5000/x:v2", "[::1]:5000/x", "v2"},
+		{"nginx:", "nginx", "latest"},
+		{"nginx@sha256:abc", "nginx", "sha256:abc"},
+		{"nginx:1.25@sha256:abc", "nginx", "sha256:abc"},
+		{"localhost:5005/app@sha256:abc", "localhost:5005/app", "sha256:abc"},
+		{"localhost:5005/app:v1@sha256:abc", "localhost:5005/app", "sha256:abc"},
+	} {
+		repo, tag := splitRef(tc.ref)
+		if repo != tc.repo || tag != tc.tag {
+			t.Errorf("%s: got (%q, %q), want (%q, %q)", tc.ref, repo, tag, tc.repo, tc.tag)
+		}
 	}
 }
 

@@ -102,7 +102,39 @@ func (c *Client) InspectContainer(ctx context.Context, id string) (*ContainerInf
 	return &out, nil
 }
 
-// PullImage pulls ref and drains the progress stream, returning any error reported in it.
+// splitRef splits an image reference into its repository and the tag (or digest) to pull.
+//
+// The Engine API pulls every tag of a repository when it is given neither a tag nor a digest
+// (the docker CLI hides this by adding ":latest"), so an untagged reference gets the tag "latest".
+// The tag separator is the last ':' after the last '/', which keeps a registry port out of the
+// tag ("localhost:5005/app" has no tag). A digest is introduced by '@' and wins over a tag.
+func splitRef(ref string) (repo, tag string) {
+	name, digest, hasDigest := strings.Cut(ref, "@")
+	if hasDigest && digest != "" {
+		if i := tagIndex(name); i >= 0 {
+			name = name[:i]
+		}
+		return name, digest
+	}
+	if i := tagIndex(name); i >= 0 {
+		if t := name[i+1:]; t != "" {
+			return name[:i], t
+		}
+		return name[:i], "latest"
+	}
+	return name, "latest"
+}
+
+// tagIndex returns the index of the ':' that starts the tag of name, or -1 when it has none.
+func tagIndex(name string) int {
+	i := strings.LastIndex(name, ":")
+	if i < 0 || i < strings.LastIndex(name, "/") {
+		return -1
+	}
+	return i
+}
+
+// PullImage pulls ref (an untagged reference is pulled as :latest) and drains the progress stream, returning any error reported in it.
 // A non-empty registryAuth is sent as the X-Registry-Auth header (base64url-encoded credentials);
 // it is never included in returned errors.
 func (c *Client) PullImage(ctx context.Context, ref, registryAuth string) error {
@@ -110,7 +142,8 @@ func (c *Client) PullImage(ctx context.Context, ref, registryAuth string) error 
 	if registryAuth != "" {
 		hdr = http.Header{"X-Registry-Auth": {registryAuth}}
 	}
-	resp, err := c.send(ctx, "POST", "/images/create", url.Values{"fromImage": {ref}}, nil, hdr)
+	repo, tag := splitRef(ref)
+	resp, err := c.send(ctx, "POST", "/images/create", url.Values{"fromImage": {repo}, "tag": {tag}}, nil, hdr)
 	if err != nil {
 		return fmt.Errorf("pull %s: %w", ref, err)
 	}
