@@ -8,6 +8,8 @@ IMAGE="${IMAGE:-docker-image-updater:dev}"
 DIND_IMAGE="${DIND_IMAGE:-docker:27-dind}"
 DIND_PORT="${DIND_PORT:-2375}"
 REG_PORT="${REG_PORT:-5005}"
+REG_USER="testuser"
+REG_PASS="testpass"
 WEB_PORT="${WEB_PORT:-18080}"
 export REF="localhost:${REG_PORT}/diu-test:latest"
 WORK="$(mktemp -d)"
@@ -26,6 +28,7 @@ cleanup() {
     echo "==> FAILURE (exit $rc), diagnostics from the dind daemon"
     docker ps -a || true
     docker logs diu-updater || true
+    docker logs diu-updater-noauth || true
   fi
   HOST_DOCKER rm -f -v diu-dind >/dev/null 2>&1
   rm -rf "$WORK"
@@ -40,6 +43,11 @@ assert_eq() { # description expected actual
 quiet() {
   local out
   out="$("$@" 2>&1)" || { echo "$out"; return 1; }
+}
+
+assert_match() { # description extended-regex haystack
+  ASSERTS=$((ASSERTS + 1))
+  if [[ "$3" =~ $2 ]]; then echo "  ok   $1"; else echo "  FAIL $1: /$2/ does not match '$3'"; FAILS=$((FAILS + 1)); fi
 }
 
 assert_contains() { # description needle haystack
@@ -67,6 +75,12 @@ if [ -z "$DIND_ID" ] || [ "$DIND_ID" == "$HOST_ID" ] || docker ps -a --format '{
   echo "SAFETY: DOCKER_HOST does not point at the isolated dind daemon, aborting"; exit 1
 fi
 DIND_VERIFIED=1
+
+# The CLI used by this script gets its own, empty, config directory: it never reads or writes the
+# developer's ~/.docker. CLI plugins (compose) are linked from there when present.
+export DOCKER_CONFIG="$WORK/cli-config"
+mkdir -p "$DOCKER_CONFIG"
+[ -d "$HOME/.docker/cli-plugins" ] && ln -s "$HOME/.docker/cli-plugins" "$DOCKER_CONFIG/cli-plugins"
 
 echo "==> loading the updater image into dind"
 env -u DOCKER_HOST docker save "$IMAGE" | docker load >/dev/null
@@ -101,10 +115,19 @@ networks:
   backend:
 EOF
 
-echo "==> starting local registry"
-docker run -d --name diu-registry --label docker-image-updater.enable=false -p "${REG_PORT}:5000" registry:2 >/dev/null
-for _ in $(seq 1 30); do curl -sf -m 3 "http://127.0.0.1:${REG_PORT}/v2/" >/dev/null && { reg_ok=1; break; }; sleep 1; done
+echo "==> starting password-protected local registry"
+docker run --rm --entrypoint htpasswd httpd:2.4-alpine -Bbn "$REG_USER" "$REG_PASS" > "$WORK/htpasswd"
+# The dind daemon cannot mount host paths: create the container, copy the file in, then start it.
+docker create --name diu-registry --label docker-image-updater.enable=false -p "${REG_PORT}:5000" \
+  -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=diu-test \
+  -e REGISTRY_AUTH_HTPASSWD_PATH=/etc/docker/registry/htpasswd registry:2 >/dev/null
+docker cp "$WORK/htpasswd" diu-registry:/etc/docker/registry/htpasswd
+docker start diu-registry >/dev/null
+for _ in $(seq 1 30); do curl -sf -m 3 -u "$REG_USER:$REG_PASS" "http://127.0.0.1:${REG_PORT}/v2/" >/dev/null && { reg_ok=1; break; }; sleep 1; done
 [ "${reg_ok:-0}" == 1 ] || { echo "registry did not become ready"; exit 1; }
+REG_ANON_CODE="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${REG_PORT}/v2/")"
+[ "$REG_ANON_CODE" == 401 ] || { echo "registry accepts anonymous requests (HTTP $REG_ANON_CODE)"; exit 1; }
+printf '%s' "$REG_PASS" | docker login "localhost:${REG_PORT}" -u "$REG_USER" --password-stdin >/dev/null
 REG_ID="$(docker inspect -f '{{.Id}} {{.State.StartedAt}}' diu-registry)"
 
 echo "==> publishing image v1 and starting workloads"
@@ -134,9 +157,15 @@ build_push 2
 NEW="$(docker image inspect -f '{{.Id}}' "$REF")"
 [ "$OLD" != "$NEW" ] || { echo "v1 and v2 images are identical"; exit 1; }
 
+echo "==> giving the updater its registry credentials through a volume"
+printf '{"auths":{"localhost:%s":{"auth":"%s"}}}\n' "$REG_PORT" "$(printf '%s:%s' "$REG_USER" "$REG_PASS" | base64 | tr -d '\n')" > "$WORK/updater-config.json"
+docker volume create diu-cfg >/dev/null
+docker run --rm -i -v diu-cfg:/config busybox:1.36 sh -c 'cat > /config/config.json' < "$WORK/updater-config.json"
+
 echo "==> starting the updater"
 docker run -d --name diu-updater \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  -v diu-cfg:/config:ro -e DOCKER_CONFIG=/config \
   -p "${WEB_PORT}:8080" \
   -e CHECK_INTERVAL_MINUTES=60 -e WEB_ENABLED=true "$IMAGE" >/dev/null
 
@@ -183,6 +212,30 @@ quiet docker compose -p diu-compose -f "$WORK/compose.yml" up -d
 assert_eq "docker compose up does not recreate the container again" "$COMPOSE_NEW" "$(id_of diu-compose)"
 assert_contains "stats API counts the scan" '"scans":1,' "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
 assert_eq "healthz" "ok" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/healthz")"
+
+assert_contains "registry credentials enabled at startup" "registry credentials enabled" "$(docker logs diu-updater 2>&1)"
+assert_eq "updater logs never contain the registry password" "0" "$(docker logs diu-updater 2>&1 | grep -c -F "$REG_PASS" || true)"
+assert_eq "stats API never contains the registry password" "0" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -c -F "$REG_PASS" || true)"
+
+echo "==> negative check: an updater without credentials cannot pull from the private registry"
+build_push 3
+BEFORE="$(for c in diu-run diu-anonv diu-anonm "$COMPOSE_NEW" "$CUSTOM_NEW"; do docker inspect -f '{{.Id}}' "$c"; done)"
+docker run -d --name diu-updater-noauth \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e CHECK_INTERVAL_MINUTES=60 "$IMAGE" >/dev/null
+NOAUTH_LINE=""
+for _ in $(seq 1 60); do
+  NOAUTH_LINE="$(docker logs diu-updater-noauth 2>&1 | grep 'cannot check image' | grep -F "localhost:${REG_PORT}/diu-test" || true)"
+  [ -n "$NOAUTH_LINE" ] && break
+  sleep 1
+done
+assert_match "updater without credentials reports an authorization failure" 'unauthorized|no basic auth credentials' "$NOAUTH_LINE"
+assert_contains "failure names the image" "localhost:${REG_PORT}/diu-test" "$NOAUTH_LINE"
+AFTER="$(for c in diu-run diu-anonv diu-anonm "$COMPOSE_NEW" "$CUSTOM_NEW"; do docker inspect -f '{{.Id}}' "$c"; done)"
+assert_eq "no container was changed by the updater without credentials" "$BEFORE" "$AFTER"
+assert_eq "no leftover _old container after the negative check" "0" "$(docker ps -a --format '{{.Names}}' | grep -c '_old$' || true)"
+assert_eq "no-credentials updater logs never contain the registry password" "0" "$(docker logs diu-updater-noauth 2>&1 | grep -c -F "$REG_PASS" || true)"
+docker rm -f -v diu-updater-noauth >/dev/null
 
 if [ "$FAILS" -ne 0 ]; then echo "$FAILS assertion(s) failed"; docker logs diu-updater; exit 1; fi
 echo "PASS ($ASSERTS assertions)"
