@@ -209,6 +209,13 @@ func (c *Client) RemoveContainer(ctx context.Context, id string, force bool) err
 	return c.do(ctx, "DELETE", "/containers/"+id, q, nil, nil)
 }
 
+// RemoveImage deletes an image by id without force. The daemon refuses with 409 when a container
+// still uses it and answers 404 when it is already gone; both come back as an *APIError.
+func (c *Client) RemoveImage(ctx context.Context, id string) error {
+	q := url.Values{"force": {"false"}, "noprune": {"false"}}
+	return c.do(ctx, "DELETE", "/images/"+id, q, nil, nil)
+}
+
 // ConnectNetwork attaches a container to a network with the given endpoint settings.
 func (c *Client) ConnectNetwork(ctx context.Context, network, containerID string, endpoint map[string]any) error {
 	body := map[string]any{"Container": containerID, "EndpointConfig": endpoint}

@@ -233,3 +233,60 @@ func TestImageConfigNotFound(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+func TestInspectContainerState(t *testing.T) {
+	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"Id":"abc123","Name":"/web","RestartCount":2,
+		"State":{"Status":"running","Running":true,"Paused":false,"Restarting":false,"OOMKilled":false,"Dead":false,
+		"Pid":4242,"ExitCode":0,"Error":"","StartedAt":"2025-01-01T10:00:00.000000000Z","FinishedAt":"0001-01-01T00:00:00Z",
+		"Health":{"Status":"starting","FailingStreak":1,"Log":[{"Start":"2025-01-01T10:00:01Z","End":"2025-01-01T10:00:01Z","ExitCode":1,"Output":"nope"}]}},
+		"Config":{"Image":"nginx:latest"},"HostConfig":{},"Mounts":[],"NetworkSettings":{"Networks":{}}}`))
+	})
+	info, err := c.InspectContainer(context.Background(), "abc123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.State.Running || info.State.Restarting || info.State.Status != "running" || info.State.ExitCode != 0 || info.RestartCount != 2 {
+		t.Fatalf("%+v", info)
+	}
+	if info.State.Health == nil || info.State.Health.Status != "starting" {
+		t.Fatalf("health: %+v", info.State.Health)
+	}
+}
+
+func TestInspectContainerWithoutHealthcheckHasNilHealth(t *testing.T) {
+	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"Id":"abc","State":{"Status":"exited","Running":false,"Restarting":false,"ExitCode":3},"RestartCount":0}`))
+	})
+	info, err := c.InspectContainer(context.Background(), "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State.Health != nil || info.State.Running || info.State.ExitCode != 3 || info.State.Status != "exited" {
+		t.Fatalf("%+v", info.State)
+	}
+}
+
+func TestRemoveImage(t *testing.T) {
+	var seen string
+	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Method + " " + r.URL.RequestURI()
+		w.Write([]byte(`[{"Deleted":"sha256:111"}]`))
+	})
+	if err := c.RemoveImage(context.Background(), "sha256:111"); err != nil {
+		t.Fatal(err)
+	}
+	if want := "DELETE /images/sha256:111?force=false&noprune=false"; seen != want {
+		t.Fatalf("got %q want %q", seen, want)
+	}
+}
+
+func TestRemoveImageConflictIsAnAPIError(t *testing.T) {
+	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"message":"conflict: unable to delete, image is being used by running container"}`, 409)
+	})
+	var ae *APIError
+	if err := c.RemoveImage(context.Background(), "sha256:111"); !errors.As(err, &ae) || ae.Status != 409 {
+		t.Fatalf("%v", err)
+	}
+}

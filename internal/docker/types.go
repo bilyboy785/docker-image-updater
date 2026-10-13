@@ -50,6 +50,18 @@ type Mount struct {
 	RW          bool
 }
 
+// ContainerState is the runtime state of an inspected container.
+type ContainerState struct {
+	Status     string // created, running, restarting, exited, ...
+	Running    bool
+	Restarting bool
+	ExitCode   int
+	// Health is nil when the container has no healthcheck.
+	Health *struct {
+		Status string // starting, healthy or unhealthy
+	}
+}
+
 // ContainerInfo keeps Config and HostConfig as generic maps so that every field the
 // daemon returns is preserved when the container is recreated.
 type ContainerInfo struct {
@@ -58,6 +70,8 @@ type ContainerInfo struct {
 	Config          map[string]any
 	HostConfig      map[string]any
 	Mounts          []Mount
+	State           ContainerState
+	RestartCount    int
 	NetworkSettings struct {
 		Networks map[string]map[string]any
 	}
