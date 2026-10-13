@@ -66,20 +66,20 @@ type Event struct {
 
 // Snapshot is a copy of the counters and recent events at a point in time.
 type Snapshot struct {
-	Version    string    `json:"version"`
-	Mode       string    `json:"mode"`
-	StartedAt  time.Time `json:"started_at"`
-	Scans      int       `json:"scans"`
-	LastScan   time.Time `json:"last_scan"`
-	NextScan   time.Time `json:"next_scan"`
-	LastScanMs int64     `json:"last_scan_ms"`
-	Watched    int       `json:"watched"`
-	Skipped    int       `json:"skipped"`
-	Updates    int       `json:"updates"`
-	Failures   int       `json:"failures"`
-	Rollbacks  int       `json:"rollbacks"`
-	Events     []Event   `json:"events"`
-	Scanning   bool      `json:"scanning"`
+	Version    string            `json:"version"`
+	Mode       string            `json:"mode"`
+	StartedAt  time.Time         `json:"started_at"`
+	Scans      int               `json:"scans"`
+	LastScan   time.Time         `json:"last_scan"`
+	NextScan   time.Time         `json:"next_scan"`
+	LastScanMs int64             `json:"last_scan_ms"`
+	Watched    int               `json:"watched"`
+	Skipped    int               `json:"skipped"`
+	Updates    int               `json:"updates"`
+	Failures   int               `json:"failures"`
+	Rollbacks  int               `json:"rollbacks"`
+	Events     []Event           `json:"events"`
+	Scanning   bool              `json:"scanning"`
 	Containers []ContainerStatus `json:"containers"`
 	// LastProgress is the last time the scan made progress (see Touch). New fields are appended
 	// after it: consumers rely on the JSON key order. It is never persisted.
