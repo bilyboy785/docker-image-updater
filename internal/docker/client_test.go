@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -54,8 +55,39 @@ func TestPullImage(t *testing.T) {
 		}
 		w.Write([]byte(`{"status":"Pulling"}` + "\n" + `{"status":"Done"}` + "\n"))
 	})
-	if err := c.PullImage(context.Background(), "nginx:latest"); err != nil {
+	if err := c.PullImage(context.Background(), "nginx:latest", ""); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPullImageRegistryAuthHeader(t *testing.T) {
+	for _, auth := range []string{"abc123", ""} {
+		var got []string
+		c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Values("X-Registry-Auth")
+			w.Write([]byte(`{"status":"Done"}` + "\n"))
+		})
+		if err := c.PullImage(context.Background(), "ghcr.io/o/i:1", auth); err != nil {
+			t.Fatal(err)
+		}
+		if auth == "" && len(got) != 0 {
+			t.Fatalf("header must be absent for anonymous pulls, got %v", got)
+		}
+		if auth != "" && (len(got) != 1 || got[0] != auth) {
+			t.Fatalf("got %v", got)
+		}
+	}
+}
+
+func TestPullErrorsNeverEchoTheAuthHeader(t *testing.T) {
+	for name, h := range map[string]http.HandlerFunc{
+		"http error":   func(w http.ResponseWriter, r *http.Request) { http.Error(w, "unauthorized", 401) },
+		"stream error": func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"error":"denied"}` + "\n")) },
+	} {
+		err := newTest(t, h).PullImage(context.Background(), "ghcr.io/o/i:1", "SECRETHEADER")
+		if err == nil || strings.Contains(err.Error(), "SECRETHEADER") {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }
 
@@ -63,7 +95,7 @@ func TestPullImageStreamError(t *testing.T) {
 	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"status":"Pulling"}` + "\n" + `{"error":"pull access denied"}` + "\n"))
 	})
-	err := c.PullImage(context.Background(), "x/y:z")
+	err := c.PullImage(context.Background(), "x/y:z", "")
 	if err == nil || err.Error() != "pull x/y:z: pull access denied" {
 		t.Fatalf("got %v", err)
 	}

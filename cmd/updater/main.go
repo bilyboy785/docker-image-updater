@@ -14,6 +14,7 @@ import (
 	"github.com/bilyboy785/docker-image-updater/internal/config"
 	"github.com/bilyboy785/docker-image-updater/internal/docker"
 	"github.com/bilyboy785/docker-image-updater/internal/notify"
+	"github.com/bilyboy785/docker-image-updater/internal/registry"
 	"github.com/bilyboy785/docker-image-updater/internal/stats"
 	"github.com/bilyboy785/docker-image-updater/internal/updater"
 	"github.com/bilyboy785/docker-image-updater/internal/web"
@@ -48,7 +49,11 @@ func main() {
 	}
 
 	host, _ := os.Hostname()
-	u := updater.New(docker.New(cfg.Socket), notifier, st, host, cfg.DryRun, log)
+	creds := registry.NewStore(cfg.DockerConfig, func(msg string) { log.Warn(msg) })
+	u := updater.New(docker.New(cfg.Socket), notifier, st, host, cfg.DryRun, log).WithRegistryAuth(creds)
+	if cfg.DockerConfig != "" {
+		log.Info("registry credentials enabled", "config_dir", cfg.DockerConfig)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

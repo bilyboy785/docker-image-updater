@@ -22,8 +22,9 @@ type fakeDocker struct {
 	pullErr    map[string]error
 	failOn     map[string]error // method name -> error
 	calls      []string
-	onPull     func() // optional hook, runs inside PullImage
-	onStop     func() // optional hook, runs inside StopContainer
+	pullAuth   map[string]string // ref -> registry auth passed to PullImage
+	onPull     func()            // optional hook, runs inside PullImage
+	onStop     func()            // optional hook, runs inside StopContainer
 
 	imageCfg    map[string]any // returned by ImageConfig
 	imageCfgErr error
@@ -47,8 +48,12 @@ func (f *fakeDocker) InspectContainer(ctx context.Context, id string) (*docker.C
 	}
 	return f.info[id], f.fail("Inspect")
 }
-func (f *fakeDocker) PullImage(ctx context.Context, ref string) error {
+func (f *fakeDocker) PullImage(ctx context.Context, ref, registryAuth string) error {
 	f.rec("pull " + ref)
+	if f.pullAuth == nil {
+		f.pullAuth = map[string]string{}
+	}
+	f.pullAuth[ref] = registryAuth
 	if f.onPull != nil {
 		f.onPull()
 	}
@@ -357,8 +362,8 @@ const fullSequence = "pull nginx:latest|rename a a_old|stop a|create a|start new
 // the scenario "ctx cancelled right as the cycle reaches recreate" can be exercised.
 type noCtxCheckPull struct{ *fakeDocker }
 
-func (c *noCtxCheckPull) PullImage(_ context.Context, ref string) error {
-	return c.fakeDocker.PullImage(context.Background(), ref)
+func (c *noCtxCheckPull) PullImage(_ context.Context, ref, auth string) error {
+	return c.fakeDocker.PullImage(context.Background(), ref, auth)
 }
 func (c *noCtxCheckPull) ImageID(_ context.Context, ref string) (string, error) {
 	return c.fakeDocker.ImageID(context.Background(), ref)
@@ -649,12 +654,12 @@ func (b *blockingDocker) ListContainers(ctx context.Context) ([]docker.Container
 	return b.fakeDocker.ListContainers(ctx)
 }
 
-func (b *blockingDocker) PullImage(ctx context.Context, ref string) error {
+func (b *blockingDocker) PullImage(ctx context.Context, ref, auth string) error {
 	if b.pull {
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	return b.fakeDocker.PullImage(ctx, ref)
+	return b.fakeDocker.PullImage(ctx, ref, auth)
 }
 
 func runWithDeadline(t *testing.T, u *Updater) error {
@@ -691,5 +696,68 @@ func TestStuckPullDoesNotHangTheScan(t *testing.T) {
 	}
 	if snap := s.Snapshot(); snap.Scans != 1 || snap.Failures != 2 {
 		t.Fatalf("%+v", snap)
+	}
+}
+
+type fakeAuth map[string]string
+
+func (a fakeAuth) AuthHeader(ref string) string { return a[ref] }
+
+func TestRegistryAuthIsForwardedToPull(t *testing.T) {
+	f := &fakeDocker{
+		containers: []docker.Container{web("a", "ghcr.io/o/priv:1", "sha256:1", nil), web("b", "nginx:latest", "sha256:1", nil)},
+		images:     map[string]string{"ghcr.io/o/priv:1": "sha256:1", "nginx:latest": "sha256:1"},
+	}
+	u, _, _ := newUpdater(f, false)
+	u.WithRegistryAuth(fakeAuth{"ghcr.io/o/priv:1": "HEADER-FOR-GHCR"})
+	if err := u.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.pullAuth["ghcr.io/o/priv:1"] != "HEADER-FOR-GHCR" || f.pullAuth["nginx:latest"] != "" {
+		t.Fatalf("%v", f.pullAuth)
+	}
+}
+
+func TestNoAuthProviderPullsAnonymously(t *testing.T) {
+	for _, withNil := range []bool{false, true} {
+		f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+			images: map[string]string{"nginx:latest": "sha256:1"}}
+		u, _, _ := newUpdater(f, false)
+		if withNil {
+			u.WithRegistryAuth(nil)
+		}
+		u.RunOnce(context.Background())
+		if auth, ok := f.pullAuth["nginx:latest"]; !ok || auth != "" {
+			t.Fatalf("withNil=%v: %v", withNil, f.pullAuth)
+		}
+	}
+}
+
+func TestUnauthorizedPullIsReportedOnceWithoutLeakingCredentials(t *testing.T) {
+	const secret = "SECRET-AUTH-HEADER"
+	f := &fakeDocker{
+		containers: []docker.Container{web("a", "ghcr.io/o/priv:1", "sha256:1", nil)},
+		pullErr:    map[string]error{"ghcr.io/o/priv:1": errors.New("pull ghcr.io/o/priv:1: unauthorized: authentication required")},
+	}
+	n := &fakeNotifier{}
+	s, _ := stats.New("test", "active", "")
+	var logs strings.Builder
+	u := New(f, n, s, "selfself0000", false, slog.New(slog.NewTextHandler(&logs, nil)))
+	u.WithRegistryAuth(fakeAuth{"ghcr.io/o/priv:1": secret})
+	u.RunOnce(context.Background())
+	u.RunOnce(context.Background())
+	snap := s.Snapshot()
+	if len(snap.Events) != 1 || snap.Failures != 1 || snap.Events[0].Status != stats.StatusFailed ||
+		!strings.Contains(snap.Events[0].Error, "unauthorized") {
+		t.Fatalf("%+v", snap)
+	}
+	if len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "unauthorized") {
+		t.Fatalf("%v", n.msgs)
+	}
+	evJSON := fmt.Sprintf("%+v", snap.Events)
+	for name, text := range map[string]string{"log": logs.String(), "notification": strings.Join(n.msgs, "\n"), "events": evJSON} {
+		if strings.Contains(text, secret) {
+			t.Errorf("%s leaks the registry credentials: %s", name, text)
+		}
 	}
 }

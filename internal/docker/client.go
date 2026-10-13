@@ -34,7 +34,7 @@ func NewWithBase(base string, hc *http.Client) *Client {
 	return &Client{hc: hc, base: strings.TrimRight(base, "/")}
 }
 
-func (c *Client) send(ctx context.Context, method, path string, q url.Values, body any) (*http.Response, error) {
+func (c *Client) send(ctx context.Context, method, path string, q url.Values, body any, extra ...http.Header) (*http.Response, error) {
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -53,6 +53,13 @@ func (c *Client) send(ctx context.Context, method, path string, q url.Values, bo
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for _, h := range extra {
+		for k, vs := range h {
+			for _, v := range vs {
+				req.Header.Add(k, v)
+			}
+		}
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
@@ -96,8 +103,14 @@ func (c *Client) InspectContainer(ctx context.Context, id string) (*ContainerInf
 }
 
 // PullImage pulls ref and drains the progress stream, returning any error reported in it.
-func (c *Client) PullImage(ctx context.Context, ref string) error {
-	resp, err := c.send(ctx, "POST", "/images/create", url.Values{"fromImage": {ref}}, nil)
+// A non-empty registryAuth is sent as the X-Registry-Auth header (base64url-encoded credentials);
+// it is never included in returned errors.
+func (c *Client) PullImage(ctx context.Context, ref, registryAuth string) error {
+	var hdr http.Header
+	if registryAuth != "" {
+		hdr = http.Header{"X-Registry-Auth": {registryAuth}}
+	}
+	resp, err := c.send(ctx, "POST", "/images/create", url.Values{"fromImage": {ref}}, nil, hdr)
 	if err != nil {
 		return fmt.Errorf("pull %s: %w", ref, err)
 	}

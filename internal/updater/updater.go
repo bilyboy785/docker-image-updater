@@ -31,7 +31,7 @@ const (
 type DockerAPI interface {
 	ListContainers(ctx context.Context) ([]docker.Container, error)
 	InspectContainer(ctx context.Context, id string) (*docker.ContainerInfo, error)
-	PullImage(ctx context.Context, ref string) error
+	PullImage(ctx context.Context, ref, registryAuth string) error
 	ImageID(ctx context.Context, ref string) (string, error)
 	ImageConfig(ctx context.Context, ref string) (map[string]any, error)
 	CreateContainer(ctx context.Context, name string, body map[string]any) (string, error)
@@ -40,6 +40,12 @@ type DockerAPI interface {
 	RemoveContainer(ctx context.Context, id string, force bool) error
 	RenameContainer(ctx context.Context, id, name string) error
 	ConnectNetwork(ctx context.Context, network, containerID string, endpoint map[string]any) error
+}
+
+// AuthProvider returns the value of the X-Registry-Auth header to use to pull ref, or "" to pull
+// anonymously.
+type AuthProvider interface {
+	AuthHeader(ref string) string
 }
 
 // Updater runs scans and recreates containers whose image changed.
@@ -51,6 +57,7 @@ type Updater struct {
 	dryRun   bool
 	log      *slog.Logger
 	notified map[string]bool // dedup keys of notifications already sent since start
+	auth     AuthProvider    // registry credentials; nil means anonymous pulls
 
 	apiTimeout  time.Duration
 	pullTimeout time.Duration
@@ -61,6 +68,13 @@ type Updater struct {
 func New(d DockerAPI, n notify.Notifier, s *stats.Stats, selfID string, dryRun bool, log *slog.Logger) *Updater {
 	return &Updater{docker: d, notifier: n, stats: s, selfID: selfID, dryRun: dryRun, log: log, notified: map[string]bool{},
 		apiTimeout: defaultAPITimeout, pullTimeout: defaultPullTimeout}
+}
+
+// WithRegistryAuth sets the provider of registry credentials used for pulls (nil: anonymous)
+// and returns the updater.
+func (u *Updater) WithRegistryAuth(p AuthProvider) *Updater {
+	u.auth = p
+	return u
 }
 
 var bareID = regexp.MustCompile(`^(sha256:)?[0-9a-f]{12,64}$`)
@@ -145,7 +159,11 @@ func (u *Updater) configImage(ctx context.Context, id string) string {
 // full container list of the scan, used to find containers depending on an updated one.
 func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.Container) {
 	pctx, pcancel := context.WithTimeout(ctx, u.pullTimeout)
-	err := u.docker.PullImage(pctx, ref)
+	auth := ""
+	if u.auth != nil {
+		auth = u.auth.AuthHeader(ref)
+	}
+	err := u.docker.PullImage(pctx, ref, auth)
 	pcancel()
 	if err != nil {
 		u.reportImageFailure(ctx, "pull", ref, cs, err)

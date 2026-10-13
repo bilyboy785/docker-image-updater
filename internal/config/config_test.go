@@ -20,7 +20,7 @@ func TestDefaults(t *testing.T) {
 	if c.Interval != 60*time.Minute || c.Socket != "/var/run/docker.sock" || c.WebAddr != ":8080" {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
-	if c.DryRun || c.WebEnabled || c.TelegramToken != "" || c.StateFile != "" {
+	if c.DryRun || c.WebEnabled || c.TelegramToken != "" || c.StateFile != "" || c.DockerConfig != "" {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 }
@@ -35,13 +35,21 @@ func TestFromEnv(t *testing.T) {
 		"WEB_ADDR":               "127.0.0.1:9000",
 		"STATE_FILE":             "/data/state.json",
 		"DOCKER_SOCKET":          "/tmp/d.sock",
+		"DOCKER_CONFIG":          " /config ",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock"}
+	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock", "/config"}
 	if c != want {
 		t.Fatalf("got %+v want %+v", c, want)
+	}
+}
+
+func TestDockerConfigFlagOverridesEnv(t *testing.T) {
+	c, err := Load([]string{"-docker-config", "/flag"}, env(map[string]string{"DOCKER_CONFIG": "/env"}))
+	if err != nil || c.DockerConfig != "/flag" {
+		t.Fatalf("%+v %v", c, err)
 	}
 }
 
@@ -86,7 +94,7 @@ func TestHelpRequested(t *testing.T) {
 func TestUsageListsFlagsEnvVarsAndDefaults(t *testing.T) {
 	u := Usage()
 	for _, want := range []string{"-interval", "CHECK_INTERVAL_MINUTES", "-telegram-token", "TELEGRAM_BOT_TOKEN",
-		"-dry-run", "DRY_RUN", "-web-addr", "WEB_ADDR", "-state-file", "STATE_FILE", "-socket", "DOCKER_SOCKET", "/var/run/docker.sock", "60"} {
+		"-dry-run", "DRY_RUN", "-web-addr", "WEB_ADDR", "-state-file", "STATE_FILE", "-socket", "DOCKER_SOCKET", "-docker-config", "DOCKER_CONFIG", "/var/run/docker.sock", "60"} {
 		if !strings.Contains(u, want) {
 			t.Errorf("usage is missing %q:\n%s", want, u)
 		}
