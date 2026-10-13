@@ -90,24 +90,51 @@ export REG_USER REG_PASS
 echo "==> loading the updater image into dind"
 env -u DOCKER_HOST docker save "$IMAGE" | docker load >/dev/null
 
-build_push() { # version
+# Standard HEALTHCHECK of the healthy test images: passes as soon as /version exists.
+HC_OK='HEALTHCHECK --interval=1s --retries=1 CMD test -f /version'
+
+publish_image() { # ref version [healthcheck-line] [cmd-line]
+  local ref="$1" v="$2" hc="${3:-}" cmd="${4:-}"
+  [ -n "$cmd" ] || cmd="CMD [\"sh\", \"-c\", \"trap 'exit 0' TERM; : app-v$v; while :; do sleep 1; done\"]"
   mkdir -p "$WORK/img"
   # Env, label and Cmd differ between versions, to check that the new image's defaults win.
-  cat > "$WORK/img/Dockerfile" <<EOF
-FROM busybox:1.36
-ARG VERSION
-ENV APP_VERSION=$1
-LABEL app.version=$1
-RUN echo "\$VERSION" > /version
-CMD ["sh", "-c", "trap 'exit 0' TERM; : app-v$1; while :; do sleep 1; done"]
-EOF
-  docker build -q --build-arg VERSION="$1" -t "$REF" "$WORK/img" >/dev/null
+  # The image reference is baked into a label so that every repository has distinct image ids.
+  {
+    echo "FROM busybox:1.36"
+    echo "ARG VERSION"
+    echo "ENV APP_VERSION=$v"
+    echo "LABEL app.version=$v"
+    echo "LABEL app.ref=$ref"
+    echo 'RUN echo "$VERSION" > /version'
+    if [ -n "$hc" ]; then echo "$hc"; fi
+    echo "$cmd"
+  } > "$WORK/img/Dockerfile"
+  docker build -q --build-arg VERSION="$v" -t "$ref" "$WORK/img" >/dev/null
   # Push from inside the dind container: its own client has its own config, no credential helper.
-  HOST_DOCKER exec -e REF diu-dind docker push -q "$REF" >/dev/null
+  HOST_DOCKER exec -e REF="$ref" diu-dind docker push -q "$ref" >/dev/null
   # Replace the locally built image by the one pulled from the registry: with the containerd store
   # an image keeps its build origin, and a locally built image is (rightly) ignored by the updater.
-  docker rmi "$REF" >/dev/null
-  HOST_DOCKER exec -e REF diu-dind docker pull -q "$REF" >/dev/null
+  docker rmi "$ref" >/dev/null
+  HOST_DOCKER exec -e REF="$ref" diu-dind docker pull -q "$ref" >/dev/null
+}
+
+# The standard image: versions above 1 carry a healthcheck, so the updated containers go through
+# the "healthy" path of the post-start gate.
+build_push() { # version
+  if [ "$1" == 1 ]; then publish_image "$REF" "$1"; else publish_image "$REF" "$1" "$HC_OK"; fi
+}
+
+# Publishes v2 of ref while the local tag still points at v1, then moves the tag back to v1: the
+# containers run v1 and the updater itself must be the one to pull v2, as in real life. The v1
+# image is kept under a second name meanwhile (with the containerd store, replacing a tag deletes
+# the image that had it).
+publish_v2_over_v1() { # ref [healthcheck-line] [cmd-line]
+  local ref="$1" keep
+  keep="diu-keep:$(printf '%s' "$1" | tr '/:' '__')"
+  docker tag "$ref" "$keep"
+  publish_image "$ref" 2 "${2:-}" "${3:-}"
+  docker tag "$keep" "$ref"
+  docker rmi "$keep" >/dev/null
 }
 
 dind_login() {
@@ -186,10 +213,23 @@ docker exec "$CUSTOM_ID" sh -c 'echo persisted > /data/marker'
 docker exec diu-anonv sh -c 'echo persisted > /anonv/marker'
 docker exec diu-anonm sh -c 'echo persisted > /anonm/marker'
 
+echo "==> publishing the health gate and cleanup scenario images (v1) and starting their containers"
+CRASH_REF="localhost:${REG_PORT}/diu-crash:latest"
+UNHEALTHY_REF="localhost:${REG_PORT}/diu-unhealthy:latest"
+CLEAN_REF="localhost:${REG_PORT}/diu-clean:latest"
+for pair in "diu-crash:$CRASH_REF" "diu-unhealthy:$UNHEALTHY_REF" "diu-clean:$CLEAN_REF"; do
+  name="${pair%%:*}"; ref="${pair#*:}"
+  publish_image "$ref" 1 "$HC_OK"
+  docker run -d --name "$name" "$ref" >/dev/null
+done
+CRASH_CID="$(docker inspect -f '{{.Id}}' diu-crash)"
+CRASH_OLD="$(docker inspect -f '{{.Image}}' diu-crash)"
+UNHEALTHY_CID="$(docker inspect -f '{{.Id}}' diu-unhealthy)"
+UNHEALTHY_OLD="$(docker inspect -f '{{.Image}}' diu-unhealthy)"
+CLEAN_CID="$(docker inspect -f '{{.Id}}' diu-clean)"
+CLEAN_OLD="$(docker inspect -f '{{.Image}}' diu-clean)"
+
 echo "==> publishing image v2"
-# Keep v1 under a second name while v2 takes over the tag, then point the tag back at v1: the
-# running containers use v1 and the updater itself must be the one to pull v2 over it, as in real
-# life. (With the containerd store, replacing a tag deletes the image that had it.)
 docker tag "$REF" diu-keep:v1
 build_push 2
 NEW="$(docker image inspect -f '{{.Id}}' "$REF")"
@@ -197,6 +237,14 @@ NEW="$(docker image inspect -f '{{.Id}}' "$REF")"
 docker tag diu-keep:v1 "$REF"
 docker rmi diu-keep:v1 >/dev/null
 assert_eq "the local tag points at v1 again" "$OLD" "$(docker image inspect -f '{{.Id}}' "$REF")"
+# v2 of the scenario images: a crash (exit code 3, no healthcheck), a failing healthcheck, and a
+# healthy one whose old image the updater is asked to clean up.
+publish_v2_over_v1 "$CRASH_REF" "" 'CMD ["sh", "-c", "exit 3"]'
+publish_v2_over_v1 "$UNHEALTHY_REF" 'HEALTHCHECK --interval=1s --retries=1 CMD false'
+publish_v2_over_v1 "$CLEAN_REF" "$HC_OK"
+assert_eq "the crash image tag points at v1 again" "$CRASH_OLD" "$(docker image inspect -f '{{.Id}}' "$CRASH_REF")"
+assert_eq "the unhealthy image tag points at v1 again" "$UNHEALTHY_OLD" "$(docker image inspect -f '{{.Id}}' "$UNHEALTHY_REF")"
+assert_eq "the clean image tag points at v1 again" "$CLEAN_OLD" "$(docker image inspect -f '{{.Id}}' "$CLEAN_REF")"
 
 echo "==> giving the updater its registry credentials through a volume"
 printf '{"auths":{"localhost:%s":{"auth":"%s"}}}\n' "$REG_PORT" "$(printf '%s:%s' "$REG_USER" "$REG_PASS" | base64 | tr -d '\n')" > "$WORK/updater-config.json"
@@ -210,18 +258,52 @@ docker run -d --name diu-updater --label docker-image-updater.enable=false \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v diu-cfg:/config:ro -e DOCKER_CONFIG=/config \
   -p "${WEB_PORT}:8080" \
-  -e CHECK_INTERVAL_MINUTES=60 -e WEB_ENABLED=true "$IMAGE" >/dev/null
+  -e CHECK_INTERVAL_MINUTES=60 -e WEB_ENABLED=true \
+  -e HEALTH_WAIT_SECONDS=30 -e CLEANUP_IMAGES=true "$IMAGE" >/dev/null
 
-echo "==> waiting for the updates to be applied"
+stat() { # name: numeric field of the stats API, whatever the JSON field order
+  curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -o "\"$1\":[0-9]*" | head -1 | cut -d: -f2
+}
+
+echo "==> waiting for the first scan (updates, health gate rollbacks) to finish"
 ok=0
-for _ in $(seq 1 120); do
-  stats="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" || true)"
-  if [[ "$stats" == *'"updates":5,'* && "$stats" == *'"scans":1,'* ]]; then ok=1; break; fi
+for _ in $(seq 1 240); do
+  if [ "$(stat scans || true)" == 1 ]; then ok=1; break; fi
   sleep 1
 done
-if [ "$ok" != 1 ]; then echo "timeout waiting for updates"; docker logs diu-updater; exit 1; fi
+if [ "$ok" != 1 ]; then echo "timeout waiting for the first scan"; docker logs diu-updater; exit 1; fi
 
 echo "==> assertions"
+# 5 containers of the standard image and diu-clean are updated; diu-crash and diu-unhealthy are rolled back.
+assert_eq "updates count (5 standard containers + diu-clean)" "6" "$(stat updates)"
+assert_eq "rollbacks count (diu-crash, diu-unhealthy)" "2" "$(stat rollbacks)"
+assert_eq "failures count" "0" "$(stat failures)"
+STATS1="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+# New containers of the standard image went through the healthy path of the gate.
+assert_eq "updated container has a healthcheck that reports healthy" "healthy" "$(docker inspect -f '{{.State.Health.Status}}' diu-run)"
+
+echo "==> health gate: a crashing new container is rolled back"
+assert_eq "diu-crash is running" "true" "$(docker inspect -f '{{.State.Running}}' diu-crash)"
+assert_eq "diu-crash is the original container (same id)" "$CRASH_CID" "$(docker inspect -f '{{.Id}}' diu-crash)"
+assert_eq "diu-crash still runs the v1 image" "$CRASH_OLD" "$(docker inspect -f '{{.Image}}' diu-crash)"
+assert_eq "diu-crash has a single container left (no leftover new one)" "1" "$(docker ps -a --filter name=diu-crash --format '{{.Names}}' | wc -l | tr -d ' ')"
+assert_match "diu-crash event is rolled_back" '"container":"diu-crash","image":"[^"]*","old_id":"[^"]*","new_id":"[^"]*","status":"rolled_back","error":"new container failed health gate: [^"]*exit code 3' "$STATS1"
+assert_eq "diu-crash has no updated event" "0" "$(grep -o '"container":"diu-crash","image":"[^"]*","old_id":"[^"]*","new_id":"[^"]*","status":"updated"' <<< "$STATS1" | wc -l | tr -d ' ')"
+
+echo "==> health gate: a new container with a failing healthcheck is rolled back"
+assert_eq "diu-unhealthy is running" "true" "$(docker inspect -f '{{.State.Running}}' diu-unhealthy)"
+assert_eq "diu-unhealthy is the original container (same id)" "$UNHEALTHY_CID" "$(docker inspect -f '{{.Id}}' diu-unhealthy)"
+assert_eq "diu-unhealthy still runs the v1 image" "$UNHEALTHY_OLD" "$(docker inspect -f '{{.Image}}' diu-unhealthy)"
+assert_eq "diu-unhealthy has a single container left (no leftover new one)" "1" "$(docker ps -a --filter name=diu-unhealthy --format '{{.Names}}' | wc -l | tr -d ' ')"
+assert_match "diu-unhealthy event is rolled_back" '"container":"diu-unhealthy","image":"[^"]*","old_id":"[^"]*","new_id":"[^"]*","status":"rolled_back","error":"new container failed health gate: [^"]*unhealthy' "$STATS1"
+
+echo "==> cleanup of the old image"
+CLEAN_NEW="$(docker image inspect -f '{{.Id}}' "$CLEAN_REF")"
+assert_eq "diu-clean uses the new image" "$CLEAN_NEW" "$(docker inspect -f '{{.Image}}' diu-clean)"
+assert_eq "diu-clean was recreated" "1" "$([ "$CLEAN_CID" != "$(docker inspect -f '{{.Id}}' diu-clean)" ] && echo 1 || echo 0)"
+assert_eq "the old v1 image of diu-clean was removed" "gone" "$(docker image inspect "$CLEAN_OLD" >/dev/null 2>&1 && echo present || echo gone)"
+assert_eq "the shared v1 image still used by other containers was kept" "present" "$(docker image inspect "$OLD" >/dev/null 2>&1 && echo present || echo gone)"
+assert_eq "the v1 images of the rolled back containers were kept" "present" "$(docker image inspect "$CRASH_OLD" "$UNHEALTHY_OLD" >/dev/null 2>&1 && echo present || echo gone)"
 COMPOSE_NEW="$(id_of diu-compose)"
 CUSTOM_NEW="$(id_of diu-custom)"
 assert_eq "docker run container uses the new image" "$NEW" "$(docker inspect -f '{{.Image}}' diu-run)"
@@ -254,7 +336,7 @@ assert_eq "locally built container untouched (same id)" "$LOCAL_CID" "$(docker i
 assert_eq "locally built container keeps its image" "$LOCAL_IMG" "$(docker inspect -f '{{.Image}}' diu-local)"
 assert_eq "updater logs show no failure for the local image" "0" "$(docker logs diu-updater 2>&1 | grep -c 'cannot check image.*local-only' || true)"
 assert_eq "updater never tries to pull the local image" "0" "$(docker logs diu-updater 2>&1 | grep -c 'local-only' || true)"
-assert_contains "no failure is counted" '"failures":0,' "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+assert_eq "no failure is counted" "0" "$(stat failures)"
 SKIPPED="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -o '"skipped":[0-9]*' | cut -d: -f2)"
 # Skipped: the opt-out container, the registry (opt-out) and the local container.
 assert_eq "skipped count covers the opt-out and local containers" "1" "$([ "${SKIPPED:-0}" -ge 3 ] && echo 1 || echo 0)"
@@ -270,7 +352,7 @@ assert_eq "no leftover _old container" "0" "$(docker ps -a --format '{{.Names}}'
 assert_eq "updater still running" "true" "$(docker inspect -f '{{.State.Running}}' diu-updater)"
 quiet docker compose -p diu-compose -f "$WORK/compose.yml" up -d
 assert_eq "docker compose up does not recreate the container again" "$COMPOSE_NEW" "$(id_of diu-compose)"
-assert_contains "stats API counts the scan" '"scans":1,' "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+assert_eq "stats API counts the scan" "1" "$(stat scans)"
 assert_eq "healthz" "ok" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/healthz")"
 
 echo "==> forcing a scan from the web API"
@@ -280,7 +362,7 @@ assert_eq "scan without the X-Requested-With header is rejected" "403" "$(scan_p
 assert_eq "scan with a foreign Origin is rejected" "403" "$(scan_post -H 'X-Requested-With: docker-image-updater' -H 'Origin: http://evil.example')"
 assert_eq "GET on the scan endpoint is not allowed" "405" "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "$SCAN_URL" || true)"
 REJECTED_STATS="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
-assert_contains "rejected scan requests did not start a scan" '"scans":1,' "$REJECTED_STATS"
+assert_eq "rejected scan requests did not start a scan" "1" "$(stat scans)"
 assert_contains "no scan is running after rejected requests" '"scanning":false' "$REJECTED_STATS"
 # The last scan may have started less than 30 s ago: retry while the server answers 429.
 SCAN_CODE=""
@@ -293,12 +375,12 @@ assert_eq "scan with the header is accepted" "202" "$SCAN_CODE"
 assert_match "an immediate second scan request is refused" '^(409|429)$' "$(scan_post -H 'X-Requested-With: docker-image-updater')"
 scan2=0
 for _ in $(seq 1 60); do
-  if [[ "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" || true)" == *'"scans":2,'* ]]; then scan2=1; break; fi
+  if [ "$(stat scans || true)" == 2 ]; then scan2=1; break; fi
   sleep 1
 done
 assert_eq "the forced scan ran (scans count reached 2)" "1" "$scan2"
 STATS2="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
-assert_contains "no failure after the forced scan" '"failures":0,' "$STATS2"
+assert_eq "no failure after the forced scan" "0" "$(stat failures)"
 for pair in "diu-local:$LOCAL_CID:$LOCAL_IMG" "diu-notify:$NOTIFY_CID:$OLD" "diu-window:$WINDOW_CID:$OLD"; do
   IFS=: read -r name cid img <<< "$pair"
   assert_eq "$name keeps its container id after the forced scan" "$cid" "$(docker inspect -f '{{.Id}}' "$name")"
