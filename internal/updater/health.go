@@ -42,8 +42,8 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 // replace the old one. The note is non-empty when the update is kept with a caveat. ctx bounds the
 // work and is detached from the caller; caller is the caller's own context: when it is cancelled
 // while the gate runs (the updater is stopping) the gate is abandoned at once and the update is
-// rolled back, so that the old container is back quickly. A caller already cancelled when the
-// gate starts does not abort it.
+// rolled back, so that the old container is back quickly. This includes a caller that was
+// already cancelled when the gate starts.
 //
 // With a healthcheck the verdict is the one of the healthcheck; a check still "starting" when
 // the wait elapses is accepted, since a slow starter must not be rolled back wrongly. Without a
@@ -59,12 +59,11 @@ func (u *Updater) waitHealthy(ctx, caller context.Context, newID string, wait ti
 		window = wait
 	}
 	deadline := u.hnow().Add(wait)
-	watch := caller.Err() == nil
 	var first time.Time
 	seen, lastHealth := false, false
 	errs := 0
 	for {
-		if watch && caller.Err() != nil {
+		if caller.Err() != nil {
 			return "", &gateError{"updater stopping during health gate"}
 		}
 		ictx, cancel := context.WithTimeout(ctx, u.apiTimeout)
@@ -130,10 +129,6 @@ func (u *Updater) waitHealthy(ctx, caller context.Context, newID string, wait ti
 			}
 			return "", nil
 		}
-		if watch {
-			u.hsleep(caller, healthPollInterval)
-		} else {
-			u.hsleep(ctx, healthPollInterval)
-		}
+		u.hsleep(caller, healthPollInterval)
 	}
 }

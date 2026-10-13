@@ -139,7 +139,7 @@ Set `HEALTH_WAIT_SECONDS=0` to disable the gate: the update then succeeds as soo
 
 Details:
 
-- A healthcheck verdict takes time. With Docker's default settings (interval 30 s, 3 retries, plus the `start_period`), a broken but still running application is only reported `unhealthy` after about 90 s. Set `HEALTH_WAIT_SECONDS` to at least `start_period + interval * retries` to catch such an application. Crashes and restarts are always caught within a few seconds, whatever the value.
+- A healthcheck verdict takes time. With Docker's default settings (interval 30 s, 3 retries, plus the `start_period`), a broken but still running application is only reported `unhealthy` after about 90 s. Set `HEALTH_WAIT_SECONDS` to at least `start_period + interval * retries` to catch such an application. Crashes and restarts are always caught within a few seconds during the gate, whatever the value.
 - A container whose `Health` status is empty or `none` is treated as having no healthcheck.
 - A failed inspection on the very last poll does not fail the gate: the last valid observation is used.
 - A restart count above 0 counts, even if the restart happened before the first observation. The 10 seconds of stability start at the first successful observation.

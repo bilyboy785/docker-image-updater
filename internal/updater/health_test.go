@@ -270,16 +270,21 @@ func TestGateAbortsAndRollsBackWhenTheUpdaterIsStoppedMidGate(t *testing.T) {
 	}
 }
 
-func TestGateIsNotAbortedByACancelThatHappenedBeforeItStarted(t *testing.T) {
+func TestGateAbortsAtOnceWhenTheUpdaterWasAlreadyStoppingWhenItStarted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	u, f, _, s, _ := gateSetup(60*time.Second, running("starting"), running("healthy"))
+	u, f, n, s, _ := gateSetup(60*time.Second, running("starting"), running("healthy"))
 	u.docker = &cancelOnStart{fakeDocker: f, cancel: cancel}
 	u.RunOnce(ctx)
-	if got := strings.Join(f.calls, "|"); got != beforeGate+"|inspect newid|inspect newid|remove a" {
-		t.Fatalf("got %s", got)
+	want := beforeGate + "|remove newid|rename a a|start a"
+	if got := strings.Join(f.calls, "|"); got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-	if s.Snapshot().Updates != 1 {
-		t.Fatalf("%+v", s.Snapshot())
+	ev := s.Snapshot().Events[0]
+	if ev.Status != stats.StatusRolledBack || !strings.Contains(ev.Error, "updater stopping during health gate") {
+		t.Fatalf("%+v", ev)
+	}
+	if len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "will not be retried until a new image is published or the updater is restarted") {
+		t.Fatalf("%v", n.msgs)
 	}
 }
 

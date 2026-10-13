@@ -415,7 +415,8 @@ func (u *Updater) finish(ctx context.Context, ev stats.Event, ref, status, warn 
 	msg := fmt.Sprintf("%s <b>%s</b>\nImage: <code>%s</code>\n%s → %s",
 		head, html.EscapeString(ev.Container), html.EscapeString(ref), ev.OldID, ev.NewID)
 	if gateRollback {
-		msg += "\nRolled back to the previous image: " + html.EscapeString(gerr.reason)
+		msg += "\nRolled back to the previous image: " + html.EscapeString(gerr.reason) +
+			"\nThis image will not be retried until a new image is published or the updater is restarted."
 	} else if err != nil {
 		msg += "\nError: " + html.EscapeString(err.Error())
 	}
