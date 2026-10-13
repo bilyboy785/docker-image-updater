@@ -80,8 +80,10 @@ type Snapshot struct {
 	Rollbacks  int       `json:"rollbacks"`
 	Events     []Event   `json:"events"`
 	Scanning   bool      `json:"scanning"`
-	// Containers must stay the last field: consumers rely on the JSON key order.
 	Containers []ContainerStatus `json:"containers"`
+	// LastProgress is the last time the scan made progress (see Touch). New fields are appended
+	// after it: consumers rely on the JSON key order. It is never persisted.
+	LastProgress time.Time `json:"last_progress"`
 }
 
 // Stats is a concurrency-safe store of counters and recent events, optionally persisted to a file.
@@ -125,6 +127,14 @@ func (s *Stats) RecordScan(start time.Time, d time.Duration, watched, skipped in
 	s.snap.LastScanMs = d.Milliseconds()
 	s.snap.Watched, s.snap.Skipped = watched, skipped
 	s.saveLocked()
+}
+
+// Touch records that the scan just made progress (a pull, an inspection, a container step), so
+// that a long scan that keeps working is not mistaken for a stuck one. It is never persisted.
+func (s *Stats) Touch() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap.LastProgress = time.Now()
 }
 
 // SetNextScan sets the time of the next planned scan.
@@ -190,6 +200,7 @@ func (s *Stats) saveLocked() {
 	persisted := s.snap
 	persisted.Scanning = false
 	persisted.Containers = nil
+	persisted.LastProgress = time.Time{}
 	b, err := json.Marshal(persisted)
 	if err == nil {
 		tmp := filepath.Join(filepath.Dir(s.path), "."+filepath.Base(s.path)+".tmp")

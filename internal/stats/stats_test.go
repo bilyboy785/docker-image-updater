@@ -140,7 +140,7 @@ func TestScanningJSONKeyPrecedesContainers(t *testing.T) {
 	s, _ := New("v", "active", "")
 	s.SetScanning(true)
 	b, _ := json.Marshal(s.Snapshot())
-	if !strings.HasSuffix(string(b), `,"scanning":true,"containers":[]}`) {
+	if !strings.Contains(string(b), `,"scanning":true,"containers":[]`) {
 		t.Fatalf("scanning must be the last key before containers: %s", b)
 	}
 }
@@ -202,8 +202,40 @@ func TestContainersJSONKeyIsLast(t *testing.T) {
 	s, _ := New("v", "active", "")
 	s.SetContainers([]ContainerStatus{{Name: "a", Image: "i", ImageID: "abc", Status: ContainerSkipped, Detail: "d", Policy: "auto", Window: "w", CheckedAt: time.Unix(0, 0).UTC()}})
 	b, _ := json.Marshal(s.Snapshot())
-	want := `"containers":[{"name":"a","image":"i","image_id":"abc","status":"skipped","detail":"d","policy":"auto","window":"w","checked_at":"1970-01-01T00:00:00Z"}]}`
-	if !strings.HasSuffix(string(b), want) {
-		t.Fatalf("containers must be the last key: %s", b)
+	want := `"containers":[{"name":"a","image":"i","image_id":"abc","status":"skipped","detail":"d","policy":"auto","window":"w","checked_at":"1970-01-01T00:00:00Z"}],"last_progress":`
+	if !strings.Contains(string(b), want) {
+		t.Fatalf("last_progress must directly follow containers: %s", b)
+	}
+	if !strings.HasSuffix(string(b), "Z\"}") {
+		t.Fatalf("last_progress must be the last key: %s", b)
+	}
+}
+
+func TestTouchRecordsProgressAndIsNotPersisted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, _ := New("v", "active", path)
+	if !s.Snapshot().LastProgress.IsZero() {
+		t.Fatal("no progress before the first Touch")
+	}
+	before := time.Now()
+	s.Touch()
+	got := s.Snapshot().LastProgress
+	if got.Before(before) || got.After(time.Now()) {
+		t.Fatalf("LastProgress %v not set to now", got)
+	}
+	s.RecordEvent(Event{Status: StatusUpdated}) // triggers a save
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"last_progress":"0001-01-01T00:00:00Z"`) {
+		t.Fatalf("last_progress leaked into the state file: %s", b)
+	}
+	s2, _ := New("v", "active", path)
+	if !s2.Snapshot().LastProgress.IsZero() {
+		t.Fatal("LastProgress must be zero after a reload")
+	}
+	if s.Snapshot().LastProgress.IsZero() {
+		t.Fatal("saving must not clear the live value")
 	}
 }
