@@ -6,15 +6,16 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bilyboy785/docker-image-updater/internal/stats"
 )
 
-func handler() http.Handler {
-	return Handler(func() stats.Snapshot {
-		return stats.Snapshot{Version: "1.2.3", Mode: "active", Scans: 7, Updates: 3, Events: []stats.Event{{Container: "<img src=x>", Status: "updated"}}}
-	})
+func testSnap() stats.Snapshot {
+	return stats.Snapshot{Version: "1.2.3", Mode: "active", Scans: 7, Updates: 3, Events: []stats.Event{{Container: "<img src=x>", Status: "updated"}}}
 }
+
+func handler() http.Handler { return Handler(testSnap, nil) }
 
 func get(t *testing.T, path string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -78,5 +79,127 @@ func TestUnknownPathAndMethod(t *testing.T) {
 func TestPageNeverUsesInnerHTMLForData(t *testing.T) {
 	if strings.Contains(string(indexHTML), "innerHTML") {
 		t.Fatal("index.html must render data with textContent, never innerHTML")
+	}
+}
+
+func scanHandler(res ScanResult) (http.Handler, *int) {
+	calls := 0
+	return Handler(testSnap, func() ScanResult { calls++; return res }), &calls
+}
+
+func post(h http.Handler, headers map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("POST", "http://example.test:8080/api/scan", strings.NewReader(`{"ignored":true}`))
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+var csrfHeader = map[string]string{"X-Requested-With": "docker-image-updater"}
+
+func errBody(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content type %q", ct)
+	}
+	var b struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &b); err != nil {
+		t.Fatal(err)
+	}
+	return b.Error
+}
+
+func TestScanStarted(t *testing.T) {
+	h, calls := scanHandler(ScanResult{Status: ScanStarted})
+	rec := post(h, csrfHeader)
+	if rec.Code != 202 || strings.TrimSpace(rec.Body.String()) != `{"status":"started"}` {
+		t.Fatalf("%d %q", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Content-Type") != "application/json" || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("headers %v", rec.Header())
+	}
+	if *calls != 1 {
+		t.Fatalf("trigger called %d times", *calls)
+	}
+}
+
+func TestScanAlreadyRunning(t *testing.T) {
+	h, _ := scanHandler(ScanResult{Status: ScanAlreadyRunning})
+	rec := post(h, csrfHeader)
+	if rec.Code != 409 || errBody(t, rec) != "scan already running" {
+		t.Fatalf("%d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestScanTooSoon(t *testing.T) {
+	h, _ := scanHandler(ScanResult{Status: ScanTooSoon, RetryAfter: 12*time.Second + 300*time.Millisecond})
+	rec := post(h, csrfHeader)
+	if rec.Code != 429 || errBody(t, rec) == "" {
+		t.Fatalf("%d %q", rec.Code, rec.Body.String())
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "13" {
+		t.Fatalf("Retry-After %q, want 13 (rounded up)", ra)
+	}
+}
+
+func TestScanRejectedRequestsNeverTrigger(t *testing.T) {
+	cases := map[string]map[string]string{
+		"no header":            {},
+		"wrong header value":   {"X-Requested-With": "XMLHttpRequest"},
+		"foreign origin":       {"X-Requested-With": "docker-image-updater", "Origin": "http://evil.test"},
+		"foreign origin, port": {"X-Requested-With": "docker-image-updater", "Origin": "http://example.test:9999"},
+		"null origin":          {"X-Requested-With": "docker-image-updater", "Origin": "null"},
+		"garbage origin":       {"X-Requested-With": "docker-image-updater", "Origin": "::"},
+	}
+	for name, hdr := range cases {
+		t.Run(name, func(t *testing.T) {
+			h, calls := scanHandler(ScanResult{Status: ScanStarted})
+			rec := post(h, hdr)
+			if rec.Code != 403 {
+				t.Fatalf("got %d", rec.Code)
+			}
+			if errBody(t, rec) == "" {
+				t.Error("missing error message")
+			}
+			if *calls != 0 {
+				t.Fatal("trigger must not be called")
+			}
+		})
+	}
+}
+
+func TestScanMatchingOriginAccepted(t *testing.T) {
+	h, calls := scanHandler(ScanResult{Status: ScanStarted})
+	rec := post(h, map[string]string{"X-Requested-With": "docker-image-updater", "Origin": "http://example.test:8080"})
+	if rec.Code != 202 || *calls != 1 {
+		t.Fatalf("%d, calls=%d", rec.Code, *calls)
+	}
+}
+
+func TestScanGetIsNotAllowed(t *testing.T) {
+	h, calls := scanHandler(ScanResult{Status: ScanStarted})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/scan", nil))
+	if rec.Code != 405 || *calls != 0 {
+		t.Fatalf("%d, calls=%d", rec.Code, *calls)
+	}
+}
+
+func TestScanWithoutTrigger(t *testing.T) {
+	rec := post(handler(), csrfHeader)
+	if rec.Code != 501 || errBody(t, rec) == "" {
+		t.Fatalf("%d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPageHasScanButton(t *testing.T) {
+	for _, want := range []string{"/api/scan", "X-Requested-With", "docker-image-updater", "Scan now"} {
+		if !strings.Contains(string(indexHTML), want) {
+			t.Errorf("index.html lacks %q", want)
+		}
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/bilyboy785/docker-image-updater/internal/config"
 	"github.com/bilyboy785/docker-image-updater/internal/docker"
@@ -58,26 +57,30 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	sched := updater.NewScheduler(u.RunOnce, cfg.Interval, log).WithHooks(st.SetScanning, st.SetNextScan)
+
 	if cfg.WebEnabled {
 		go func() {
 			log.Info("web server listening", "addr", cfg.WebAddr)
-			if err := web.Serve(ctx, cfg.WebAddr, web.Handler(st.Snapshot)); err != nil {
+			if err := web.Serve(ctx, cfg.WebAddr, web.Handler(st.Snapshot, func() web.ScanResult { return triggerScan(sched) })); err != nil {
 				log.Error("web server stopped", "error", err)
 			}
 		}()
 	}
 
 	log.Info("docker-image-updater started", "version", version, "mode", mode, "interval", cfg.Interval.String())
-	for {
-		if err := u.RunOnce(ctx); err != nil && ctx.Err() == nil {
-			log.Error("scan failed", "error", err)
-		}
-		st.SetNextScan(time.Now().Add(cfg.Interval))
-		select {
-		case <-ctx.Done():
-			log.Info("shutting down")
-			return
-		case <-time.After(cfg.Interval):
-		}
+	sched.Run(ctx)
+}
+
+// triggerScan adapts the scheduler to the web package.
+func triggerScan(s *updater.Scheduler) web.ScanResult {
+	r := s.Trigger()
+	switch r.Status {
+	case updater.Started:
+		return web.ScanResult{Status: web.ScanStarted}
+	case updater.AlreadyRunning:
+		return web.ScanResult{Status: web.ScanAlreadyRunning}
+	default:
+		return web.ScanResult{Status: web.ScanTooSoon, RetryAfter: r.RetryAfter}
 	}
 }

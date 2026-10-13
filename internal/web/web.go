@@ -6,7 +6,10 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/bilyboy785/docker-image-updater/internal/stats"
@@ -17,8 +20,49 @@ var indexHTML []byte
 
 const csp = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"
 
-// Handler returns the HTTP handler serving the page (/), the JSON statistics (/api/stats) and /healthz.
-func Handler(snap func() stats.Snapshot) http.Handler {
+// ScanStatus is the outcome of a manual scan request.
+type ScanStatus int
+
+const (
+	ScanStarted ScanStatus = iota
+	ScanAlreadyRunning
+	ScanTooSoon
+)
+
+// ScanResult is returned by the trigger passed to Handler. RetryAfter is only used for ScanTooSoon.
+type ScanResult struct {
+	Status     ScanStatus
+	RetryAfter time.Duration
+}
+
+// requestedWith is the value required in the X-Requested-With header of a scan request. A cross-site
+// form cannot set a custom header, and a cross-origin fetch with one needs a CORS preflight that this server never grants.
+const requestedWith = "docker-image-updater"
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// sameOrigin reports whether the Origin header, when present, designates the host the request was sent to.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	return err == nil && u.Host != "" && u.Host == r.Host
+}
+
+// Handler returns the HTTP handler serving the page (/), the JSON statistics (/api/stats), /healthz
+// and POST /api/scan, which asks for an immediate scan through trigger (answers 501 when trigger is nil).
+func Handler(snap func() stats.Snapshot, trigger func() ScanResult) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -31,6 +75,31 @@ func Handler(snap func() stats.Snapshot) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(snap())
+	})
+	mux.HandleFunc("POST /api/scan", func(w http.ResponseWriter, r *http.Request) {
+		// The request body is never read.
+		if r.Header.Get("X-Requested-With") != requestedWith || !sameOrigin(r) {
+			writeError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		if trigger == nil {
+			writeError(w, http.StatusNotImplemented, "manual scans are not available")
+			return
+		}
+		res := trigger()
+		switch res.Status {
+		case ScanStarted:
+			writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
+		case ScanAlreadyRunning:
+			writeError(w, http.StatusConflict, "scan already running")
+		default:
+			secs := int(math.Ceil(res.RetryAfter.Seconds()))
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			writeError(w, http.StatusTooManyRequests, "last scan started too recently, retry later")
+		}
 	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")

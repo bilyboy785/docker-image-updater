@@ -42,6 +42,11 @@ td.err{white-space:normal;color:var(--bad);font-size:13px;max-width:320px}
 .pill.rolled_back{color:var(--warn);background:color-mix(in srgb,var(--warn) 16%,transparent)}
 .pill.available{color:var(--info);background:color-mix(in srgb,var(--info) 14%,transparent)}
 .empty{padding:36px 16px;text-align:center;color:var(--muted)}
+.scan{display:inline-flex;align-items:center;gap:8px}
+.scan button{font:inherit;font-size:13px;font-weight:600;padding:5px 14px;border-radius:999px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer}
+.scan button:disabled{opacity:.6;cursor:default}
+.scan button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.scan .msg{font-size:12px;color:var(--muted)}
 footer{margin-top:22px;color:var(--muted);font-size:13px;text-align:center}
 </style>
 </head>
@@ -53,6 +58,7 @@ footer{margin-top:22px;color:var(--muted);font-size:13px;text-align:center}
    <span class="badge live"><span class="dot" id="dot"></span><span id="conn">live</span></span>
    <span class="badge" id="mode">—</span>
    <span class="badge mono" id="version">—</span>
+   <span class="scan"><button type="button" id="scan">Scan now</button><span class="msg" id="scanmsg" role="status" aria-live="polite"></span></span>
   </div>
  </header>
 
@@ -133,18 +139,50 @@ function render(s) {
   }
 }
 
+let timer = null, scanning = false, posting = false, awaitStart = 0;
+const setButton = () => {
+  const busy = scanning || posting || awaitStart > 0;
+  $('scan').disabled = busy;
+  $('scan').textContent = busy ? 'Scanning…' : 'Scan now';
+};
+const schedule = ms => { clearTimeout(timer); timer = setTimeout(refresh, ms); };
+
 async function refresh() {
+  let next = 10000;
   try {
     const r = await fetch('/api/stats', {cache: 'no-store'});
     if (!r.ok) throw new Error(r.status);
-    render(await r.json());
+    const s = await r.json();
+    render(s);
+    scanning = s.scanning === true;
+    if (scanning) awaitStart = 0;
+    else if (awaitStart > 0) awaitStart--;
+    if (scanning || awaitStart > 0) next = 1000;
     $('dot').className = 'dot'; $('conn').textContent = 'live';
   } catch (_) {
     $('dot').className = 'dot off'; $('conn').textContent = 'offline';
   }
+  setButton();
+  schedule(next);
 }
+
+const SCAN_MESSAGES = {409: 'A scan is already running', 429: 'Please wait before scanning again', 501: 'Manual scans are not available'};
+async function scanNow() {
+  if (posting) return;
+  posting = true; setButton();
+  $('scanmsg').textContent = '';
+  try {
+    const r = await fetch('/api/scan', {method: 'POST', headers: {'X-Requested-With': 'docker-image-updater'}});
+    if (r.status === 202) awaitStart = 5; // allow a few polls for the scan to be reported as running
+    else $('scanmsg').textContent = SCAN_MESSAGES[r.status] || 'Could not start a scan (HTTP ' + r.status + ')';
+  } catch (_) {
+    $('scanmsg').textContent = 'Could not start a scan';
+  }
+  posting = false;
+  refresh();
+}
+$('scan').addEventListener('click', scanNow);
 refresh();
-setInterval(refresh, 10000);
 </script>
 </body>
 </html>
