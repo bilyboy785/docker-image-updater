@@ -254,6 +254,19 @@ func TestStripPortsAndVolumes(t *testing.T) {
 	}
 }
 
+func TestStripKeepsExposedPortsThatArePublished(t *testing.T) {
+	body := map[string]any{
+		"ExposedPorts": map[string]any{"80/tcp": map[string]any{}, "443/tcp": map[string]any{}, "9000/tcp": map[string]any{}},
+		"HostConfig": map[string]any{"PortBindings": map[string]any{
+			"80/tcp": []any{map[string]any{"HostPort": "8080"}}}}}
+	img := map[string]any{"ExposedPorts": map[string]any{"80/tcp": map[string]any{}, "443/tcp": map[string]any{}}}
+	stripImageDefaults(body, img)
+	want := map[string]any{"80/tcp": map[string]any{}, "9000/tcp": map[string]any{}}
+	if !reflect.DeepEqual(body["ExposedPorts"], want) {
+		t.Fatalf("%v", body["ExposedPorts"])
+	}
+}
+
 func TestStripEqualCmdAndEntrypointRemoved(t *testing.T) {
 	body := map[string]any{"Entrypoint": strs("/entry.sh"), "Cmd": strs("run"), "WorkingDir": "/app",
 		"User": "app", "StopSignal": "SIGTERM", "Healthcheck": map[string]any{"Test": strs("CMD", "true")}}

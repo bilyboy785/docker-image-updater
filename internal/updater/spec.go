@@ -243,6 +243,8 @@ func stripImageDefaults(body, imgCfg map[string]any) {
 			delete(body, "Labels")
 		}
 	}
+	// The daemon only publishes ports listed in ExposedPorts: keep those the user publishes.
+	published := asMap(asMap(body["HostConfig"])["PortBindings"])
 	for _, key := range []string{"ExposedPorts", "Volumes"} {
 		m := asMap(body[key])
 		if m == nil {
@@ -251,7 +253,8 @@ func stripImageDefaults(body, imgCfg map[string]any) {
 		image := asMap(imgCfg[key])
 		kept := map[string]any{}
 		for k, v := range m {
-			if _, ok := image[k]; !ok {
+			_, isPublished := published[k]
+			if _, ok := image[k]; !ok || (key == "ExposedPorts" && isPublished) {
 				kept[k] = v
 			}
 		}
