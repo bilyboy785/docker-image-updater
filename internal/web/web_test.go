@@ -103,6 +103,28 @@ func TestPageHasTheContainerList(t *testing.T) {
 	}
 }
 
+func TestPageTablesAreWideAndWrapLongText(t *testing.T) {
+	page := string(indexHTML)
+	for _, want := range []string{
+		`main{max-width:min(1680px,96vw)`,
+		`td.wrap{white-space:normal;overflow-wrap:anywhere`,
+		`td.detail{white-space:normal;overflow-wrap:anywhere`,
+		`td.err{white-space:normal;overflow-wrap:anywhere`,
+		`table{width:100%;border-collapse:collapse;min-width:720px}`,
+		`.scroll{overflow-x:auto}`,
+		`cell(tr, c.image, 'mono wrap')`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html lacks %s", want)
+		}
+	}
+	for _, old := range []string{`max-width:1040px`, `max-width:340px`, `max-width:320px`} {
+		if strings.Contains(page, old) {
+			t.Errorf("index.html still has the old cap %s", old)
+		}
+	}
+}
+
 func TestPageChipsAndLastCheckedAreAccessible(t *testing.T) {
 	page := string(indexHTML)
 	for _, want := range []string{
