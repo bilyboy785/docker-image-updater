@@ -23,6 +23,8 @@ func TestRegistryHost(t *testing.T) {
 		"registry.example.com:5000/a/b:1@sha256:ab": "registry.example.com:5000",
 		"myhost:5000/x":             "myhost:5000",
 		"docker.io/library/nginx:1": "docker.io",
+		"[::1]:5000/x":              "[::1]:5000",
+		"GHCR.io/o/i":               "GHCR.io", // case is kept, matching is case-insensitive
 	}
 	for ref, want := range cases {
 		if got := RegistryHost(ref); got != want {
@@ -215,5 +217,87 @@ func TestWarningsNeverContainSecrets(t *testing.T) {
 		if strings.Contains(m, "TOPSECRET") || strings.Contains(m, b64("user:TOPSECRET")) {
 			t.Fatalf("warning leaks a secret: %s", m)
 		}
+	}
+}
+
+func TestExactKeyWinsThenSortedKeys(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `{"auths":{
+	  "https://ghcr.io":{"auth":"`+b64("viaScheme:1")+`"},
+	  "GHCR.io":{"auth":"`+b64("viaUpper:2")+`"},
+	  "ghcr.io":{"auth":"`+b64("exact:3")+`"}}}`)
+	s := NewStore(dir, nil)
+	if got := decode(t, s.AuthHeader("ghcr.io/o/i"))["username"]; got != "exact" {
+		t.Fatalf("got %q", got)
+	}
+	// No exact key: the sorted order decides ("http://ghcr.io/v2" < "https://ghcr.io").
+	writeConfig(t, dir, `{"auths":{"https://ghcr.io":{"auth":"`+b64("b:1")+`"},"http://ghcr.io/v2":{"auth":"`+b64("a:2")+`"}}}`)
+	for i := 0; i < 20; i++ {
+		if got := decode(t, s.AuthHeader("ghcr.io/o/i"))["username"]; got != "a" {
+			t.Fatalf("non deterministic: %q", got)
+		}
+	}
+}
+
+func TestAuthWinsOverUsernamePasswordAndEmptyPasswordIsAccepted(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `{"auths":{
+	  "a.example.com":{"auth":"`+b64("fromauth:pw")+`","username":"other","password":"other"},
+	  "b.example.com":{"auth":"`+b64("nopass:")+`"},
+	  "c.example.com":{"username":"explicit","password":""}}}`)
+	s := NewStore(dir, nil)
+	if got := decode(t, s.AuthHeader("a.example.com/x")); got["username"] != "fromauth" || got["password"] != "pw" {
+		t.Fatalf("%v", got)
+	}
+	if got := decode(t, s.AuthHeader("b.example.com/x")); got["username"] != "nopass" || got["password"] != "" {
+		t.Fatalf("%v", got)
+	}
+	if got := decode(t, s.AuthHeader("c.example.com/x")); got["username"] != "explicit" || got["password"] != "" {
+		t.Fatalf("%v", got)
+	}
+}
+
+func TestUnusableEntryWarnsOncePerHost(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `{"auths":{"bad.example.com":{"auth":"%%%BADVALUE"}}}`)
+	w := &warnings{}
+	s := NewStore(dir, w.add)
+	for i := 0; i < 3; i++ {
+		if s.AuthHeader("bad.example.com/x") != "" {
+			t.Fatal("expected anonymous")
+		}
+	}
+	if len(w.msgs) != 1 || !strings.Contains(w.msgs[0], "bad.example.com") || strings.Contains(w.msgs[0], "BADVALUE") {
+		t.Fatalf("%v", w.msgs)
+	}
+}
+
+func TestReadFailureWarningHasCauseButNoContent(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "config.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	w := &warnings{}
+	NewStore(dir, w.add).AuthHeader("ghcr.io/x")
+	if len(w.msgs) != 1 || !strings.Contains(w.msgs[0], "is a directory") {
+		t.Fatalf("%v", w.msgs)
+	}
+	w2 := &warnings{}
+	NewStore(t.TempDir(), w2.add).AuthHeader("ghcr.io/x")
+	if len(w2.msgs) != 1 || !strings.Contains(w2.msgs[0], "no such file or directory") {
+		t.Fatalf("%v", w2.msgs)
+	}
+}
+
+func TestOversizedFileIsInvalid(t *testing.T) {
+	dir := t.TempDir()
+	big := `{"auths":{"ghcr.io":{"auth":"` + b64("u:p") + `"}},"pad":"` + strings.Repeat("x", 1<<20) + `"}`
+	writeConfig(t, dir, big)
+	w := &warnings{}
+	if NewStore(dir, w.add).AuthHeader("ghcr.io/x") != "" {
+		t.Fatal("expected anonymous")
+	}
+	if len(w.msgs) != 1 || !strings.Contains(w.msgs[0], "larger than 1 MiB") {
+		t.Fatalf("%v", w.msgs)
 	}
 }

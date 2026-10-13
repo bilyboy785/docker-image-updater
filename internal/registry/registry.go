@@ -8,9 +8,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -20,7 +22,12 @@ const (
 	hubServer = "https://index.docker.io/v1/"
 )
 
+// maxConfigSize caps the size of the config file that is read.
+const maxConfigSize = 1 << 20
+
 // RegistryHost returns the registry host of an image reference ("docker.io" for Docker Hub).
+// The host is returned as written in the reference (case is kept); matching against config keys
+// is case-insensitive.
 // The first path component is a host when it contains '.' or ':' or is "localhost".
 func RegistryHost(ref string) string {
 	first, _, found := strings.Cut(ref, "/")
@@ -94,13 +101,23 @@ func (s *Store) warnOnce(msg string) {
 }
 
 func (s *Store) load() (*configFile, bool) {
-	raw, err := os.ReadFile(s.path)
+	f, err := os.Open(s.path)
+	var raw []byte
+	if err == nil {
+		defer f.Close()
+		raw, err = io.ReadAll(io.LimitReader(f, maxConfigSize+1))
+	}
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			s.warnOnce("registry credentials file " + s.path + " not found, pulling anonymously")
-		} else {
-			s.warnOnce("cannot read registry credentials file " + s.path + ", pulling anonymously")
+		cause := err.Error()
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			cause = pe.Err.Error()
 		}
+		s.warnOnce("cannot read registry credentials file " + s.path + " (" + cause + "), pulling anonymously")
+		return nil, false
+	}
+	if len(raw) > maxConfigSize {
+		s.warnOnce("registry credentials file " + s.path + " is larger than 1 MiB, pulling anonymously")
 		return nil, false
 	}
 	var cfg configFile
@@ -111,22 +128,26 @@ func (s *Store) load() (*configFile, bool) {
 	return &cfg, true
 }
 
-// credentials extracts a usable login from an entry.
+func (e authEntry) isEmpty() bool {
+	return e == authEntry{}
+}
+
+// credentials extracts a usable login from an entry. Like the Docker CLI, "auth" wins over
+// "username" and "password"; an empty password is accepted.
 func (e authEntry) credentials() (user, pass, token string, ok bool) {
 	if e.IdentityToken != "" {
 		return "", "", e.IdentityToken, true
-	}
-	if e.Username != "" && e.Password != "" {
-		return e.Username, e.Password, "", true
 	}
 	if e.Auth != "" {
 		raw, err := base64.StdEncoding.DecodeString(e.Auth)
 		if err != nil {
 			return "", "", "", false
 		}
-		if u, p, found := strings.Cut(string(raw), ":"); found && u != "" {
-			return u, p, "", true
-		}
+		u, p, found := strings.Cut(string(raw), ":")
+		return u, p, "", found && u != ""
+	}
+	if e.Username != "" {
+		return e.Username, e.Password, "", true
 	}
 	return "", "", "", false
 }
@@ -143,12 +164,22 @@ func (s *Store) AuthHeader(ref string) string {
 	}
 	host := RegistryHost(ref)
 	want := normalize(host)
-	for key, e := range cfg.Auths {
-		if normalize(key) != want {
+	// Deterministic order: the exact key first, then the other keys sorted.
+	keys := make([]string, 0, len(cfg.Auths))
+	for key := range cfg.Auths {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	sort.SliceStable(keys, func(i, j int) bool { return keys[i] == host && keys[j] != host })
+	unusable := false
+	for _, key := range keys {
+		e := cfg.Auths[key]
+		if normalize(key) != want || e.isEmpty() {
 			continue
 		}
 		user, pass, token, ok := e.credentials()
 		if !ok {
+			unusable = true
 			continue
 		}
 		server := host
@@ -164,6 +195,10 @@ func (s *Store) AuthHeader(ref string) string {
 		}
 		b, _ := json.Marshal(payload)
 		return base64.URLEncoding.EncodeToString(b)
+	}
+	if unusable {
+		s.warnOnce("registry " + host + " has an entry in the credentials file without usable credentials, pulling anonymously")
+		return ""
 	}
 	helper := cfg.CredsStore != ""
 	for key, h := range cfg.CredHelpers {
