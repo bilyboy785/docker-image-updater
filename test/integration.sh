@@ -271,6 +271,18 @@ stat() { # name: numeric field of the stats API, whatever the JSON field order
   curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -o "\"$1\":[0-9]*" | head -1 | cut -d: -f2
 }
 
+# The events array of a stats document (the container list has its own "name" keys, so greps on an
+# event's "container" key must not see it, and vice versa).
+events_of() { sed -e 's/.*"events":\[//' -e 's/\],"scanning":.*//'; }
+# cstatus NAME STATS-JSON: status of container NAME in the container list.
+cstatus() {
+  grep -o "\"name\":\"$1\",\"image\":\"[^\"]*\",\"image_id\":\"[^\"]*\",\"status\":\"[^\"]*\"" <<< "$2" | head -1 | sed -e 's/.*"status":"//' -e 's/"$//'
+}
+# cdetail NAME STATS-JSON: detail of container NAME in the container list.
+cdetail() {
+  grep -o "\"name\":\"$1\",[^}]*" <<< "$2" | head -1 | sed -e 's/.*"detail":"//' -e 's/","policy".*//'
+}
+
 echo "==> waiting for the first scan (updates, health gate rollbacks) to finish"
 ok=0
 for _ in $(seq 1 240); do
@@ -364,13 +376,48 @@ assert_contains "notify-policy update is reported as available" "diu-notify" "$(
 assert_eq "closed-window container still running" "true" "$(docker inspect -f '{{.State.Running}}' diu-window)"
 assert_eq "closed-window container untouched (same id)" "$WINDOW_CID" "$(docker inspect -f '{{.Id}}' diu-window)"
 assert_eq "closed-window container keeps the old image" "$OLD" "$(docker inspect -f '{{.Image}}' diu-window)"
-assert_eq "closed-window container is not reported" "0" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -c 'diu-window' || true)"
+assert_eq "closed-window container has no event" "0" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" | events_of | grep -c 'diu-window' || true)"
 assert_eq "no leftover _old container" "0" "$(docker ps -a --format '{{.Names}}' | grep -c '_old$' || true)"
 assert_eq "updater still running" "true" "$(docker inspect -f '{{.State.Running}}' diu-updater)"
 quiet docker compose -p diu-compose -f "$WORK/compose.yml" up -d
 assert_eq "docker compose up does not recreate the container again" "$COMPOSE_NEW" "$(id_of diu-compose)"
 assert_eq "stats API counts the scan" "1" "$(stat scans)"
 assert_eq "healthz" "ok" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/healthz")"
+assert_eq "healthz answers 200" "200" "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${WEB_PORT}/healthz")"
+
+echo "==> container list of the stats API"
+STATS3="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+assert_contains "the stats API carries the container list" '"containers":[{' "$STATS3"
+for name in diu-run "$(docker inspect -f '{{.Name}}' "$COMPOSE_NEW" | tr -d /)" "$(docker inspect -f '{{.Name}}' "$CUSTOM_NEW" | tr -d /)" \
+  diu-anonv diu-anonm diu-clean diu-plain; do
+  assert_eq "$name is listed as updated" "updated" "$(cstatus "$name" "$STATS3")"
+done
+assert_eq "diu-local is skipped" "skipped" "$(cstatus diu-local "$STATS3")"
+assert_eq "diu-local is skipped because it was built locally" "locally built image" "$(cdetail diu-local "$STATS3")"
+assert_eq "diu-optout is skipped" "skipped" "$(cstatus diu-optout "$STATS3")"
+assert_eq "diu-optout is skipped because of the label" "opted out (enable=false)" "$(cdetail diu-optout "$STATS3")"
+assert_eq "the registry is skipped" "skipped" "$(cstatus diu-registry "$STATS3")"
+assert_eq "diu-notify is update-available" "update-available" "$(cstatus diu-notify "$STATS3")"
+assert_eq "diu-rm (AutoRemove) is update-available" "update-available" "$(cstatus diu-rm "$STATS3")"
+assert_eq "diu-window is waiting-window" "waiting-window" "$(cstatus diu-window "$STATS3")"
+assert_eq "diu-crash is rolled-back" "rolled-back" "$(cstatus diu-crash "$STATS3")"
+assert_eq "diu-unhealthy is rolled-back" "rolled-back" "$(cstatus diu-unhealthy "$STATS3")"
+assert_contains "the rollback detail names the health gate" "health gate failed:" "$(cdetail diu-crash "$STATS3")"
+
+echo "==> Prometheus metrics"
+METRICS_HEADERS="$(curl -s -m 3 -D - -o /dev/null "http://127.0.0.1:${WEB_PORT}/metrics" | tr -d '\r')"
+METRICS="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/metrics")"
+assert_contains "metrics content type" 'text/plain; version=0.0.4; charset=utf-8' "$METRICS_HEADERS"
+assert_contains "diu_updates_total" $'\ndiu_updates_total 7\n' $'\n'"$METRICS"
+assert_contains "diu_rollbacks_total" $'\ndiu_rollbacks_total 2\n' $'\n'"$METRICS"
+assert_contains "diu_failures_total" $'\ndiu_failures_total 0\n' $'\n'"$METRICS"
+assert_contains "diu_scans_total" $'\ndiu_scans_total 1\n' $'\n'"$METRICS"
+assert_contains "diu_build_info" $'\ndiu_build_info{' $'\n'"$METRICS"
+assert_contains "scan counter is typed" '# TYPE diu_scans_total counter' "$METRICS"
+assert_contains "containers by status" 'diu_containers{status="rolled-back"} 2' "$METRICS"
+assert_contains "containers waiting for a window" 'diu_containers{status="waiting-window"} 1' "$METRICS"
+assert_eq "metrics never contain the registry password" "0" "$(grep -c -F "$REG_PASS" <<< "$METRICS" || true)"
+assert_eq "POST on /metrics is not allowed" "405" "$(curl -s -m 3 -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${WEB_PORT}/metrics" || true)"
 
 echo "==> forcing a scan from the web API"
 SCAN_URL="http://127.0.0.1:${WEB_PORT}/api/scan"
@@ -411,15 +458,30 @@ assert_eq "diu-crash still runs v1 after the forced scan" "$CRASH_OLD" "$(docker
 assert_eq "diu-unhealthy keeps its container id after the forced scan" "$UNHEALTHY_CID" "$(docker inspect -f '{{.Id}}' diu-unhealthy)"
 assert_eq "diu-unhealthy still runs v1 after the forced scan" "$UNHEALTHY_OLD" "$(docker inspect -f '{{.Image}}' diu-unhealthy)"
 assert_eq "the updater skipped both known bad images" "2" "$(docker logs diu-updater 2>&1 | grep -c 'skipping image that previously failed the health gate' || true)"
+# The first scan may start before the daemon lists the updater's own container as running: check it
+# on the second scan.
+assert_eq "the updater itself is listed as skipped (opt-out) after the forced scan" "skipped" "$(cstatus diu-updater "$STATS2")"
 assert_eq "diu-notify has exactly one event" "1" "$(grep -o '"container":"diu-notify"' <<< "$STATS2" | wc -l | tr -d ' ')"
 assert_contains "the notify event has the available status" '"status":"available"' "$STATS2"
-assert_eq "diu-window has no event after the forced scan" "0" "$(grep -c 'diu-window' <<< "$STATS2" || true)"
+assert_eq "diu-window has no event after the forced scan" "0" "$(events_of <<< "$STATS2" | grep -c 'diu-window' || true)"
 
 assert_contains "registry credentials enabled at startup" "registry credentials enabled" "$(docker logs diu-updater 2>&1)"
 assert_eq "updater logs never contain the registry password" "0" "$(docker logs diu-updater 2>&1 | grep -c -F "$REG_PASS" || true)"
 REG_AUTH_B64="$(printf '%s:%s' "$REG_USER" "$REG_PASS" | base64 | tr -d '\n')"
 assert_eq "updater logs never contain the base64 auth value" "0" "$(docker logs diu-updater 2>&1 | grep -c -F "$REG_AUTH_B64" || true)"
 assert_eq "stats API never contains the registry password" "0" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -c -F "$REG_PASS" || true)"
+
+echo "==> the image HEALTHCHECK (-healthcheck against the built-in web server)"
+# The updater container runs with the web server enabled: the HEALTHCHECK baked into the image
+# must turn it healthy (first probe one interval, 60 s, after the start). scratch has no shell, so
+# the status is read from the daemon instead of running the probe by hand.
+HC_STATUS=""
+for _ in $(seq 1 150); do
+  HC_STATUS="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' diu-updater)"
+  [ "$HC_STATUS" == healthy ] && break
+  sleep 1
+done
+assert_eq "the updater container becomes healthy through the image HEALTHCHECK" "healthy" "$HC_STATUS"
 
 echo "==> negative check: an updater without credentials cannot pull from the private registry"
 build_push 3
