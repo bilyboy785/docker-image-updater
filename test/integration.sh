@@ -12,6 +12,7 @@ WEB_PORT="${WEB_PORT:-18080}"
 export REF="localhost:${REG_PORT}/diu-test:latest"
 WORK="$(mktemp -d)"
 FAILS=0
+ASSERTS=0
 
 HOST_DOCKER() { env -u DOCKER_HOST docker "$@"; }
 
@@ -32,6 +33,7 @@ cleanup() {
 trap cleanup EXIT
 
 assert_eq() { # description expected actual
+  ASSERTS=$((ASSERTS + 1))
   if [ "$2" == "$3" ]; then echo "  ok   $1"; else echo "  FAIL $1: expected '$2', got '$3'"; FAILS=$((FAILS + 1)); fi
 }
 # Run a command quietly, printing its output only if it fails.
@@ -41,6 +43,7 @@ quiet() {
 }
 
 assert_contains() { # description needle haystack
+  ASSERTS=$((ASSERTS + 1))
   if [[ "$3" == *"$2"* ]]; then echo "  ok   $1"; else echo "  FAIL $1: '$2' not found in '$3'"; FAILS=$((FAILS + 1)); fi
 }
 
@@ -70,11 +73,14 @@ env -u DOCKER_HOST docker save "$IMAGE" | docker load >/dev/null
 
 build_push() { # version
   mkdir -p "$WORK/img"
-  cat > "$WORK/img/Dockerfile" <<'EOF'
+  # Env, label and Cmd differ between versions, to check that the new image's defaults win.
+  cat > "$WORK/img/Dockerfile" <<EOF
 FROM busybox:1.36
 ARG VERSION
-RUN echo "$VERSION" > /version
-CMD ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"]
+ENV APP_VERSION=$1
+LABEL app.version=$1
+RUN echo "\$VERSION" > /version
+CMD ["sh", "-c", "trap 'exit 0' TERM; : app-v$1; while :; do sleep 1; done"]
 EOF
   docker build -q --build-arg VERSION="$1" -t "$REF" "$WORK/img" >/dev/null
   docker push -q "$REF" >/dev/null
@@ -105,7 +111,9 @@ echo "==> publishing image v1 and starting workloads"
 build_push 1
 OLD="$(docker image inspect -f '{{.Id}}' "$REF")"
 docker volume create diu-vol >/dev/null
-docker run -d --name diu-run --label keep=me -v diu-vol:/data "$REF" >/dev/null
+docker run -d --name diu-run --label keep=me -e CUSTOM=yes -v diu-vol:/data "$REF" >/dev/null
+docker run -d --rm --name diu-rm "$REF" >/dev/null
+RM_ID="$(docker inspect -f '{{.Id}}' diu-rm)"
 docker run -d --name diu-optout --label docker-image-updater.enable=false "$REF" >/dev/null
 docker run -d --name diu-anonv -v /anonv "$REF" >/dev/null
 docker run -d --name diu-anonm --mount type=volume,dst=/anonm "$REF" >/dev/null
@@ -152,6 +160,13 @@ assert_eq "anonymous --mount volume container uses the new image" "$NEW" "$(dock
 assert_eq "opt-out container untouched" "$OLD" "$(docker inspect -f '{{.Image}}' diu-optout)"
 assert_eq "registry untouched" "$REG_ID" "$(docker inspect -f '{{.Id}} {{.State.StartedAt}}' diu-registry)"
 assert_eq "new version is running" "2" "$(docker exec diu-run cat /version)"
+assert_eq "new image ENV takes effect" "2" "$(docker exec diu-run sh -c 'echo "$APP_VERSION"')"
+assert_eq "new image label takes effect" "2" "$(docker inspect -f '{{index .Config.Labels "app.version"}}' diu-run)"
+assert_contains "new image Cmd takes effect" "app-v2" "$(docker inspect -f '{{json .Config.Cmd}}' diu-run)"
+assert_eq "user-set env var preserved" "yes" "$(docker exec diu-run sh -c 'echo "$CUSTOM"')"
+assert_eq "--rm container still running" "true" "$(docker inspect -f '{{.State.Running}}' diu-rm)"
+assert_eq "--rm container untouched (same id)" "$RM_ID" "$(docker inspect -f '{{.Id}}' diu-rm)"
+assert_eq "--rm container still on the old image" "$OLD" "$(docker inspect -f '{{.Image}}' diu-rm)"
 assert_eq "custom label preserved" "me" "$(docker inspect -f '{{index .Config.Labels "keep"}}' diu-run)"
 assert_eq "compose project label preserved" "diu-compose" "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$COMPOSE_NEW")"
 assert_eq "compose -p project label preserved" "diu-custom" "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$CUSTOM_NEW")"
@@ -170,4 +185,4 @@ assert_contains "stats API counts the scan" '"scans":1,' "$(curl -sf -m 3 "http:
 assert_eq "healthz" "ok" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/healthz")"
 
 if [ "$FAILS" -ne 0 ]; then echo "$FAILS assertion(s) failed"; docker logs diu-updater; exit 1; fi
-echo "PASS"
+echo "PASS ($ASSERTS assertions)"

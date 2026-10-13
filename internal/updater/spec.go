@@ -1,17 +1,20 @@
 package updater
 
 import (
+	"reflect"
 	"sort"
 	"strings"
 
 	"github.com/bilyboy785/docker-image-updater/internal/docker"
 )
 
+// networkAttach is a secondary network the new container must be connected to after creation.
 type networkAttach struct {
 	Network  string
 	Endpoint map[string]any
 }
 
+// createSpec is the payload to create a container plus the networks to attach afterwards.
 type createSpec struct {
 	Body  map[string]any
 	Extra []networkAttach
@@ -176,4 +179,107 @@ func preserveVolumes(info *docker.ContainerInfo, cfg, hc map[string]any) {
 	} else {
 		delete(cfg, "Volumes")
 	}
+}
+
+// isEmptyValue reports whether v is nil or an empty string, slice or map.
+func isEmptyValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.String, reflect.Slice, reflect.Map, reflect.Array:
+		return rv.Len() == 0
+	}
+	return false
+}
+
+// sameValue compares two config values, treating nil and empty values as equal.
+func sameValue(a, b any) bool {
+	if isEmptyValue(a) && isEmptyValue(b) {
+		return true
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+// stripImageDefaults removes from a create body everything that merely repeats the defaults of
+// the old image (imgCfg, the Config of that image). `docker inspect` returns the image and
+// container settings merged, so sending them back verbatim would pin the old image's defaults
+// (Env, Cmd, labels...) and override those of the new image. Values the user set explicitly
+// are kept. Only the top level of body is edited in place; nested maps and slices are cloned
+// before being changed, and imgCfg is never modified. A nil imgCfg leaves body unchanged.
+func stripImageDefaults(body, imgCfg map[string]any) {
+	if imgCfg == nil {
+		return
+	}
+	if env, ok := body["Env"].([]any); ok {
+		image := map[any]bool{}
+		for _, e := range asSlice(imgCfg["Env"]) {
+			image[e] = true
+		}
+		var kept []any
+		for _, e := range env {
+			if !image[e] {
+				kept = append(kept, e)
+			}
+		}
+		if len(kept) > 0 {
+			body["Env"] = kept
+		} else {
+			delete(body, "Env")
+		}
+	}
+	if labels := asMap(body["Labels"]); labels != nil {
+		image := asMap(imgCfg["Labels"])
+		kept := map[string]any{}
+		for k, v := range labels {
+			if iv, ok := image[k]; !ok || iv != v {
+				kept[k] = v
+			}
+		}
+		if len(kept) > 0 {
+			body["Labels"] = kept
+		} else {
+			delete(body, "Labels")
+		}
+	}
+	for _, key := range []string{"ExposedPorts", "Volumes"} {
+		m := asMap(body[key])
+		if m == nil {
+			continue
+		}
+		image := asMap(imgCfg[key])
+		kept := map[string]any{}
+		for k, v := range m {
+			if _, ok := image[k]; !ok {
+				kept[k] = v
+			}
+		}
+		if len(kept) > 0 {
+			body[key] = kept
+		} else {
+			delete(body, key)
+		}
+	}
+	entrypointKept := false
+	if v, ok := body["Entrypoint"]; ok {
+		if sameValue(v, imgCfg["Entrypoint"]) {
+			delete(body, "Entrypoint")
+		} else {
+			entrypointKept = true
+		}
+	}
+	for _, key := range []string{"Cmd", "WorkingDir", "User", "StopSignal", "Healthcheck"} {
+		if key == "Cmd" && entrypointKept {
+			continue // a custom entrypoint changes how Cmd is interpreted: keep it as inspected
+		}
+		if v, ok := body[key]; ok && sameValue(v, imgCfg[key]) {
+			delete(body, key)
+		}
+	}
+}
+
+func asSlice(v any) []any {
+	s, _ := v.([]any)
+	return s
 }

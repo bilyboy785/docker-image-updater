@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bilyboy785/docker-image-updater/internal/docker"
 	"github.com/bilyboy785/docker-image-updater/internal/stats"
@@ -22,6 +24,10 @@ type fakeDocker struct {
 	calls      []string
 	onPull     func() // optional hook, runs inside PullImage
 	onStop     func() // optional hook, runs inside StopContainer
+
+	imageCfg    map[string]any // returned by ImageConfig
+	imageCfgErr error
+	created     []map[string]any // bodies passed to CreateContainer
 }
 
 func (f *fakeDocker) rec(s string)        { f.calls = append(f.calls, s) }
@@ -54,8 +60,15 @@ func (f *fakeDocker) PullImage(ctx context.Context, ref string) error {
 func (f *fakeDocker) ImageID(ctx context.Context, ref string) (string, error) {
 	return f.images[ref], ctx.Err()
 }
-func (f *fakeDocker) CreateContainer(ctx context.Context, name string, _ map[string]any) (string, error) {
+func (f *fakeDocker) ImageConfig(ctx context.Context, ref string) (map[string]any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return f.imageCfg, f.imageCfgErr
+}
+func (f *fakeDocker) CreateContainer(ctx context.Context, name string, body map[string]any) (string, error) {
 	f.rec("create " + name)
+	f.created = append(f.created, body)
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -354,14 +367,24 @@ func (c *noCtxCheckPull) InspectContainer(_ context.Context, id string) (*docker
 	return c.fakeDocker.InspectContainer(context.Background(), id)
 }
 
+// cancelOnInspect cancels the caller context when the container is inspected, right before recreate.
+type cancelOnInspect struct {
+	*noCtxCheckPull
+	cancel func()
+}
+
+func (c *cancelOnInspect) InspectContainer(ctx context.Context, id string) (*docker.ContainerInfo, error) {
+	c.cancel()
+	return c.noCtxCheckPull.InspectContainer(ctx, id)
+}
+
 func TestCancelledContextBeforeRecreateStillCompletesUpdate(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
 		info:   map[string]*docker.ContainerInfo{"a": basicInfo("a")},
 		images: map[string]string{"nginx:latest": "sha256:2"}}
-	f.onPull = cancel // the cycle then proceeds into recreate with a dead caller context
 	u, n, s := newUpdater(f, false)
-	u.docker = &noCtxCheckPull{f}
+	u.docker = &cancelOnInspect{&noCtxCheckPull{f}, cancel} // the cycle reaches recreate with a dead caller context
 	u.RunOnce(ctx)
 	if got := strings.Join(f.calls, "|"); got != fullSequence {
 		t.Fatalf("got  %s\nwant %s", got, fullSequence)
@@ -436,6 +459,237 @@ func TestConnectNetworkFailureRollsBack(t *testing.T) {
 		t.Fatalf("got %s", got)
 	}
 	if snap := s.Snapshot(); snap.Rollbacks != 1 || snap.Events[0].Status != stats.StatusRolledBack {
+		t.Fatalf("%+v", snap)
+	}
+}
+
+func TestCreateBodyIsStrippedOfOldImageDefaults(t *testing.T) {
+	info := basicInfo("a")
+	info.Config["Env"] = []any{"PG_MAJOR=16", "CUSTOM=yes"}
+	info.Config["Cmd"] = []any{"old"}
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:     map[string]*docker.ContainerInfo{"a": info},
+		images:   map[string]string{"nginx:latest": "sha256:2"},
+		imageCfg: map[string]any{"Env": []any{"PG_MAJOR=16"}, "Cmd": []any{"old"}}}
+	u, _, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	if len(f.created) != 1 || s.Snapshot().Updates != 1 {
+		t.Fatalf("%v %+v", f.created, s.Snapshot())
+	}
+	body := f.created[0]
+	if !reflect.DeepEqual(body["Env"], []any{"CUSTOM=yes"}) {
+		t.Errorf("env %v", body["Env"])
+	}
+	if _, ok := body["Cmd"]; ok {
+		t.Errorf("cmd must come from the new image: %v", body["Cmd"])
+	}
+}
+
+func TestImageConfigErrorStillUpdates(t *testing.T) {
+	info := basicInfo("a")
+	info.Config["Env"] = []any{"PG_MAJOR=16"}
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:        map[string]*docker.ContainerInfo{"a": info},
+		images:      map[string]string{"nginx:latest": "sha256:2"},
+		imageCfgErr: &docker.APIError{Status: 404, Message: "no such image"}}
+	u, n, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	if snap := s.Snapshot(); snap.Updates != 1 || snap.Failures != 0 || len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "Updated") {
+		t.Fatalf("%+v %v", snap, n.msgs)
+	}
+	if !reflect.DeepEqual(f.created[0]["Env"], []any{"PG_MAJOR=16"}) {
+		t.Errorf("body must be left unstripped: %v", f.created[0])
+	}
+}
+
+func autoRemoveInfo(id string) *docker.ContainerInfo {
+	info := basicInfo(id)
+	info.HostConfig["AutoRemove"] = true
+	return info
+}
+
+func TestAutoRemoveContainerIsNeverTouchedAndNotifiedOnce(t *testing.T) {
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:   map[string]*docker.ContainerInfo{"a": autoRemoveInfo("a")},
+		images: map[string]string{"nginx:latest": "sha256:2"}}
+	u, n, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	u.RunOnce(context.Background())
+	for _, c := range f.calls {
+		if !strings.HasPrefix(c, "pull") {
+			t.Fatalf("an AutoRemove container must never be touched: %v", f.calls)
+		}
+	}
+	if len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "--rm") || !strings.Contains(n.msgs[0], "manual") {
+		t.Fatalf("%v", n.msgs)
+	}
+	snap := s.Snapshot()
+	if len(snap.Events) != 1 || snap.Events[0].Status != stats.StatusAvailable || snap.Updates != 0 {
+		t.Fatalf("%+v", snap)
+	}
+}
+
+func TestPullFailureIsReportedOnce(t *testing.T) {
+	f := &fakeDocker{
+		containers: []docker.Container{web("a<", "priv/img:1", "sha256:1", nil), web("b", "priv/img:1", "sha256:1", nil)},
+		pullErr:    map[string]error{"priv/img:1": errors.New("pull access denied <x>")},
+	}
+	u, n, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	u.RunOnce(context.Background())
+	snap := s.Snapshot()
+	if len(snap.Events) != 1 || snap.Failures != 1 || snap.Events[0].Status != stats.StatusFailed {
+		t.Fatalf("%+v", snap)
+	}
+	if ev := snap.Events[0]; ev.Container != "a<, b" || ev.Image != "priv/img:1" || !strings.Contains(ev.Error, "pull access denied") {
+		t.Fatalf("%+v", ev)
+	}
+	if len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "a&lt;, b") || !strings.Contains(n.msgs[0], "&lt;x&gt;") {
+		t.Fatalf("%v", n.msgs)
+	}
+}
+
+func TestImageIDFailureIsReportedOnce(t *testing.T) {
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)}}
+	u, n, s := newUpdater(f, false)
+	u.docker = &imageIDFails{f}
+	u.RunOnce(context.Background())
+	u.RunOnce(context.Background())
+	if snap := s.Snapshot(); len(snap.Events) != 1 || snap.Failures != 1 || len(n.msgs) != 1 {
+		t.Fatalf("%+v %v", snap, n.msgs)
+	}
+}
+
+type imageIDFails struct{ *fakeDocker }
+
+func (imageIDFails) ImageID(context.Context, string) (string, error) {
+	return "", errors.New("no such image")
+}
+
+func TestDependantsOfNetworkModeContainerAreNamed(t *testing.T) {
+	vpn := web("vpn", "nginx:latest", "sha256:1", nil)
+	vpn.ID = "vpnfullid"
+	dep := web("dep<", "other:1", "sha256:9", nil)
+	dep.NetworkMode = "container:vpnfullid"
+	byName := web("dep2", "other:1", "sha256:9", nil)
+	byName.NetworkMode = "container:vpn"
+	unrelated := web("x", "other:1", "sha256:9", nil)
+	unrelated.NetworkMode = "container:else"
+	f := &fakeDocker{containers: []docker.Container{vpn, dep, byName, unrelated},
+		info:   map[string]*docker.ContainerInfo{"vpnfullid": basicInfo("vpn")},
+		images: map[string]string{"nginx:latest": "sha256:2", "other:1": "sha256:9"}}
+	u, n, _ := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	if len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "dep&lt;, dep2") || strings.Contains(n.msgs[0], "<b>x</b>") ||
+		!strings.Contains(n.msgs[0], "manually") {
+		t.Fatalf("%v", n.msgs)
+	}
+}
+
+func TestCancelledContextBetweenPullAndInspectDoesNotReportFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:   map[string]*docker.ContainerInfo{"a": basicInfo("a")},
+		images: map[string]string{"nginx:latest": "sha256:2"}}
+	f.onPull = cancel
+	u, n, s := newUpdater(f, false)
+	u.docker = &noCtxCheckPull{f}
+	u.RunOnce(ctx)
+	if len(n.msgs) != 0 || len(s.Snapshot().Events) != 0 || strings.Contains(strings.Join(f.calls, "|"), "rename") {
+		t.Fatalf("%v %+v %v", n.msgs, s.Snapshot(), f.calls)
+	}
+}
+
+func TestRollbackFailureMentionsServiceDown(t *testing.T) {
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:   map[string]*docker.ContainerInfo{"a": basicInfo("a")},
+		images: map[string]string{"nginx:latest": "sha256:2"},
+		failOn: map[string]error{"StartNew": errors.New("boom")}}
+	u, _, s := newUpdater(f, false)
+	u.docker = &renameBackFails{f}
+	u.RunOnce(context.Background())
+	ev := s.Snapshot().Events[0]
+	if ev.Status != stats.StatusFailed || !strings.Contains(ev.Error, "DOWN") || !strings.Contains(ev.Error, "a_old") {
+		t.Fatalf("%+v", ev)
+	}
+}
+
+type renameBackFails struct{ *fakeDocker }
+
+func (r *renameBackFails) RenameContainer(ctx context.Context, id, name string) error {
+	if name == "a" {
+		return errors.New("rename refused")
+	}
+	return r.fakeDocker.RenameContainer(ctx, id, name)
+}
+
+func TestSelfPrefixMatchNeedsAtLeast12Chars(t *testing.T) {
+	u, _, _ := newUpdater(&fakeDocker{}, false)
+	u.selfID = "abc"
+	if u.isSelf(web("abcdef123456", "i", "x", nil)) {
+		t.Error("a short hostname must not match by prefix")
+	}
+	u.selfID = "abcdef123456"
+	if !u.isSelf(web("abcdef1234567890", "i", "x", nil)) {
+		t.Error("a 12-char id must match by prefix")
+	}
+}
+
+// blockingDocker blocks selected calls until their context is done, like a hung daemon.
+type blockingDocker struct {
+	*fakeDocker
+	list, pull bool
+}
+
+func (b *blockingDocker) ListContainers(ctx context.Context) ([]docker.Container, error) {
+	if b.list {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return b.fakeDocker.ListContainers(ctx)
+}
+
+func (b *blockingDocker) PullImage(ctx context.Context, ref string) error {
+	if b.pull {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return b.fakeDocker.PullImage(ctx, ref)
+}
+
+func runWithDeadline(t *testing.T, u *Updater) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- u.RunOnce(context.Background()) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunOnce hung on a blocked Docker call")
+		return nil
+	}
+}
+
+func TestStuckListDoesNotHangTheScan(t *testing.T) {
+	f := &fakeDocker{}
+	u, _, _ := newUpdater(f, false)
+	u.docker = &blockingDocker{fakeDocker: f, list: true}
+	u.apiTimeout = 50 * time.Millisecond
+	if err := runWithDeadline(t, u); err == nil || !strings.Contains(err.Error(), "list containers") {
+		t.Fatalf("%v", err)
+	}
+}
+
+func TestStuckPullDoesNotHangTheScan(t *testing.T) {
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil), web("b", "other:1", "sha256:1", nil)},
+		images: map[string]string{"other:1": "sha256:1"}}
+	u, _, s := newUpdater(f, false)
+	u.docker = &blockingDocker{fakeDocker: f, pull: true}
+	u.pullTimeout = 50 * time.Millisecond
+	if err := runWithDeadline(t, u); err != nil {
+		t.Fatal(err)
+	}
+	if snap := s.Snapshot(); snap.Scans != 1 || snap.Failures != 2 {
 		t.Fatalf("%+v", snap)
 	}
 }

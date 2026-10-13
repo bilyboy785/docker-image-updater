@@ -201,3 +201,114 @@ func TestBindsAreNotSharedAcrossCalls(t *testing.T) {
 		t.Fatal("input binds backing array was written")
 	}
 }
+
+func strs(v ...string) []any {
+	out := make([]any, len(v))
+	for i, s := range v {
+		out[i] = s
+	}
+	return out
+}
+
+func TestStripEnvKeepsUserVariables(t *testing.T) {
+	body := map[string]any{"Env": strs("PATH=/old", "PG_MAJOR=16", "POSTGRES_PASSWORD=x", "CUSTOM=yes")}
+	img := map[string]any{"Env": strs("PATH=/old", "PG_MAJOR=16", "POSTGRES_PASSWORD=")}
+	stripImageDefaults(body, img)
+	if got := body["Env"]; !reflect.DeepEqual(got, strs("POSTGRES_PASSWORD=x", "CUSTOM=yes")) {
+		t.Fatalf("%v", got)
+	}
+}
+
+func TestStripEnvRemovedWhenNothingRemains(t *testing.T) {
+	body := map[string]any{"Env": strs("A=1")}
+	stripImageDefaults(body, map[string]any{"Env": strs("A=1")})
+	if _, ok := body["Env"]; ok {
+		t.Fatalf("%v", body)
+	}
+}
+
+func TestStripLabelsKeepsNonImageLabels(t *testing.T) {
+	body := map[string]any{"Labels": map[string]any{
+		"org.opencontainers.image.version": "1", "com.docker.compose.project": "p", "changed": "mine"}}
+	img := map[string]any{"Labels": map[string]any{"org.opencontainers.image.version": "1", "changed": "image"}}
+	stripImageDefaults(body, img)
+	want := map[string]any{"com.docker.compose.project": "p", "changed": "mine"}
+	if got := body["Labels"]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("%v", got)
+	}
+}
+
+func TestStripPortsAndVolumes(t *testing.T) {
+	body := map[string]any{
+		"ExposedPorts": map[string]any{"80/tcp": map[string]any{}, "9000/tcp": map[string]any{}},
+		"Volumes":      map[string]any{"/data": map[string]any{}}}
+	img := map[string]any{
+		"ExposedPorts": map[string]any{"80/tcp": map[string]any{}},
+		"Volumes":      map[string]any{"/data": map[string]any{}}}
+	stripImageDefaults(body, img)
+	if !reflect.DeepEqual(body["ExposedPorts"], map[string]any{"9000/tcp": map[string]any{}}) {
+		t.Fatalf("%v", body["ExposedPorts"])
+	}
+	if _, ok := body["Volumes"]; ok {
+		t.Fatalf("%v", body["Volumes"])
+	}
+}
+
+func TestStripEqualCmdAndEntrypointRemoved(t *testing.T) {
+	body := map[string]any{"Entrypoint": strs("/entry.sh"), "Cmd": strs("run"), "WorkingDir": "/app",
+		"User": "app", "StopSignal": "SIGTERM", "Healthcheck": map[string]any{"Test": strs("CMD", "true")}}
+	img := map[string]any{"Entrypoint": strs("/entry.sh"), "Cmd": strs("run"), "WorkingDir": "/app",
+		"User": "app", "StopSignal": "SIGTERM", "Healthcheck": map[string]any{"Test": strs("CMD", "true")}}
+	stripImageDefaults(body, img)
+	if len(body) != 0 {
+		t.Fatalf("%v", body)
+	}
+}
+
+func TestStripNilAndEmptyAreEquivalent(t *testing.T) {
+	body := map[string]any{"Entrypoint": nil, "Cmd": strs("run"), "User": ""}
+	stripImageDefaults(body, map[string]any{"Cmd": strs("run")})
+	if len(body) != 0 {
+		t.Fatalf("%v", body)
+	}
+}
+
+func TestStripCustomCmdKept(t *testing.T) {
+	body := map[string]any{"Cmd": strs("custom")}
+	stripImageDefaults(body, map[string]any{"Cmd": strs("run")})
+	if !reflect.DeepEqual(body["Cmd"], strs("custom")) {
+		t.Fatalf("%v", body)
+	}
+}
+
+func TestStripCustomEntrypointKeepsCmd(t *testing.T) {
+	body := map[string]any{"Entrypoint": strs("/mine"), "Cmd": strs("run")}
+	stripImageDefaults(body, map[string]any{"Entrypoint": strs("/entry.sh"), "Cmd": strs("run")})
+	if !reflect.DeepEqual(body["Entrypoint"], strs("/mine")) || !reflect.DeepEqual(body["Cmd"], strs("run")) {
+		t.Fatalf("%v", body)
+	}
+}
+
+func TestStripNilImageConfigIsNoop(t *testing.T) {
+	body := map[string]any{"Env": strs("A=1"), "Cmd": strs("x")}
+	stripImageDefaults(body, nil)
+	if !reflect.DeepEqual(body, map[string]any{"Env": strs("A=1"), "Cmd": strs("x")}) {
+		t.Fatalf("%v", body)
+	}
+}
+
+func TestStripNeverMutatesInputs(t *testing.T) {
+	env := strs("A=1", "B=2")
+	labels := map[string]any{"l": "1", "k": "2"}
+	ports := map[string]any{"80/tcp": map[string]any{}}
+	imgEnv := strs("A=1")
+	imgLabels := map[string]any{"l": "1"}
+	imgPorts := map[string]any{"80/tcp": map[string]any{}}
+	img := map[string]any{"Env": imgEnv, "Labels": imgLabels, "ExposedPorts": imgPorts, "Cmd": strs("x")}
+	body := map[string]any{"Env": env, "Labels": labels, "ExposedPorts": ports, "Cmd": strs("x")}
+	stripImageDefaults(body, img)
+	if !reflect.DeepEqual(env, strs("A=1", "B=2")) || len(labels) != 2 || len(ports) != 1 ||
+		!reflect.DeepEqual(imgEnv, strs("A=1")) || len(imgLabels) != 1 || len(imgPorts) != 1 || img["Cmd"] == nil {
+		t.Fatal("inputs were mutated")
+	}
+}
