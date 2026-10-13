@@ -136,7 +136,9 @@ func (u *Updater) touch() {
 func (u *Updater) note(c docker.Container, ref, status, detail string) {
 	u.touch()
 	pol := "auto"
-	if p, err := ParsePolicy(c.Labels); err == nil && p.Notify {
+	if p, err := ParsePolicy(c.Labels); err != nil {
+		pol = "invalid"
+	} else if p.Notify {
 		pol = "notify"
 	}
 	if u.report == nil {
@@ -195,7 +197,9 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 			continue
 		}
 		if _, err := ParsePolicy(c.Labels); err != nil {
+			// Fail closed, and say so at once, not only when a newer image exists.
 			u.warnBadPolicy(c, err)
+			u.note(c, c.Image, stats.ContainerSkipped, "invalid label: "+err.Error())
 		}
 		watched++
 		if _, ok := groups[c.Image]; !ok {
@@ -294,7 +298,11 @@ func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.C
 		case u.isSelf(c):
 			u.note(c, ref, stats.ContainerSelf, "never updates itself")
 		default:
-			u.note(c, ref, stats.ContainerUpToDate, "")
+			if _, perr := ParsePolicy(c.Labels); perr != nil {
+				u.note(c, ref, stats.ContainerSkipped, "invalid label: "+perr.Error())
+			} else {
+				u.note(c, ref, stats.ContainerUpToDate, "")
+			}
 		}
 	}
 	return 0

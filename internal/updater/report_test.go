@@ -140,7 +140,34 @@ func TestReportWaitingWindow(t *testing.T) {
 func TestReportInvalidLabel(t *testing.T) {
 	f := updatable(map[string]string{PolicyLabel: "sometimes"})
 	_, s := scan(f, false)
-	wantEntry(t, entry(t, s, "a"), stats.ContainerSkipped, "invalid label: ")
+	e := entry(t, s, "a")
+	wantEntry(t, e, stats.ContainerSkipped, "invalid label: ")
+	if e.Policy != "invalid" {
+		t.Fatalf("policy %q", e.Policy)
+	}
+}
+
+func TestReportInvalidLabelWithoutANewerImage(t *testing.T) {
+	for name, tc := range map[string]struct {
+		labels map[string]string
+		newID  string
+	}{
+		"up to date":     {map[string]string{WindowLabel: "nonsense"}, "sha256:1"},
+		"newer image":    {map[string]string{WindowLabel: "nonsense"}, "sha256:2"},
+		"bad policy":     {map[string]string{PolicyLabel: "sometimes"}, "sha256:1"},
+		"window too big": {map[string]string{WindowLabel: "25:00-26:00"}, "sha256:1"},
+	} {
+		f := updatable(tc.labels)
+		f.images["nginx:latest"] = tc.newID
+		_, s := scan(f, false)
+		e := entry(t, s, "a")
+		if e.Status != stats.ContainerSkipped || !strings.HasPrefix(e.Detail, "invalid label: ") || e.Policy != "invalid" {
+			t.Fatalf("%s: %+v", name, e)
+		}
+		if hasMutation(f.calls) {
+			t.Fatalf("%s: fail closed: %v", name, f.calls)
+		}
+	}
 }
 
 func TestReportUpdated(t *testing.T) {
