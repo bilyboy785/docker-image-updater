@@ -34,6 +34,7 @@ type DockerAPI interface {
 	PullImage(ctx context.Context, ref, registryAuth string) error
 	ImageID(ctx context.Context, ref string) (string, error)
 	ImageConfig(ctx context.Context, ref string) (map[string]any, error)
+	ImageRepoDigests(ctx context.Context, id string) ([]string, error)
 	CreateContainer(ctx context.Context, name string, body map[string]any) (string, error)
 	StartContainer(ctx context.Context, id string) error
 	StopContainer(ctx context.Context, id string) error
@@ -56,8 +57,9 @@ type Updater struct {
 	selfID   string
 	dryRun   bool
 	log      *slog.Logger
-	notified map[string]bool // dedup keys of notifications already sent since start
-	auth     AuthProvider    // registry credentials; nil means anonymous pulls
+	notified map[string]bool  // dedup keys of notifications already sent since start
+	auth     AuthProvider     // registry credentials; nil means anonymous pulls
+	now      func() time.Time // clock used to evaluate update windows
 
 	apiTimeout  time.Duration
 	pullTimeout time.Duration
@@ -66,7 +68,7 @@ type Updater struct {
 // New returns an Updater. selfID is the updater's own container id or hostname, used to
 // recognise (and never recreate) its own container.
 func New(d DockerAPI, n notify.Notifier, s *stats.Stats, selfID string, dryRun bool, log *slog.Logger) *Updater {
-	return &Updater{docker: d, notifier: n, stats: s, selfID: selfID, dryRun: dryRun, log: log, notified: map[string]bool{},
+	return &Updater{docker: d, notifier: n, stats: s, selfID: selfID, dryRun: dryRun, log: log, notified: map[string]bool{}, now: time.Now,
 		apiTimeout: defaultAPITimeout, pullTimeout: defaultPullTimeout}
 }
 
@@ -131,7 +133,9 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 		if ctx.Err() != nil {
 			break
 		}
-		u.checkImage(ctx, ref, groups[ref], containers)
+		n := u.checkImage(ctx, ref, groups[ref], containers)
+		watched -= n
+		skipped += n
 	}
 	u.stats.RecordScan(start, time.Since(start), watched, skipped)
 	return ctx.Err()
@@ -157,7 +161,11 @@ func (u *Updater) configImage(ctx context.Context, id string) string {
 
 // checkImage pulls ref and updates every container in cs running an older image. all is the
 // full container list of the scan, used to find containers depending on an updated one.
-func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.Container) {
+// It returns the number of containers it skipped because their image was built locally.
+func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.Container) int {
+	if u.isLocalImage(ctx, ref, cs[0]) {
+		return len(cs)
+	}
 	pctx, pcancel := context.WithTimeout(ctx, u.pullTimeout)
 	auth := ""
 	if u.auth != nil {
@@ -167,23 +175,47 @@ func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.C
 	pcancel()
 	if err != nil {
 		u.reportImageFailure(ctx, "pull", ref, cs, err)
-		return
+		return 0
 	}
 	ictx, icancel := context.WithTimeout(ctx, u.apiTimeout)
 	newID, err := u.docker.ImageID(ictx, ref)
 	icancel()
 	if err != nil {
 		u.reportImageFailure(ctx, "image id", ref, cs, err)
-		return
+		return 0
 	}
 	for _, c := range cs {
 		if ctx.Err() != nil {
-			return // shutting down: do not turn that into a failed update
+			return 0 // shutting down: do not turn that into a failed update
 		}
 		if c.ImageID != newID {
 			u.handle(ctx, c, ref, newID, all)
 		}
 	}
+	return 0
+}
+
+// isLocalImage reports whether the image run by c never came from a registry (built locally or
+// loaded from an archive): it has no repo digest and cannot be pulled. The containers of a group
+// share one reference, so the first one is representative. When the lookup fails the image is
+// treated as pullable, so that this check can never block updates.
+func (u *Updater) isLocalImage(ctx context.Context, ref string, c docker.Container) bool {
+	ictx, cancel := context.WithTimeout(ctx, u.apiTimeout)
+	digests, err := u.docker.ImageRepoDigests(ictx, c.ImageID)
+	cancel()
+	if err != nil {
+		if ctx.Err() == nil && !u.notified["digests|"+c.ImageID] {
+			u.notified["digests|"+c.ImageID] = true
+			u.log.Warn("cannot tell whether the image was built locally, checking it anyway",
+				"image", ref, "image_id", shortID(c.ImageID), "error", err)
+		}
+		return false
+	}
+	if len(digests) > 0 {
+		return false
+	}
+	u.log.Debug("ignoring locally built image", "image", ref, "image_id", shortID(c.ImageID))
+	return true
 }
 
 // reportImageFailure logs a pull or image lookup failure and, once per image reference and error
@@ -240,6 +272,24 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 			note = "\nThe updater does not update itself: manual update required."
 		}
 		u.announceAvailable(ctx, ev, c, newID, note)
+		return
+	}
+	pol, perr := ParsePolicy(c.Labels)
+	if perr != nil {
+		// Fail closed: a typo must never turn into an update outside the intended window.
+		if key := "policy|" + c.ID + "|" + c.Labels[PolicyLabel] + "|" + c.Labels[WindowLabel]; !u.notified[key] {
+			u.notified[key] = true
+			u.log.Warn("invalid update policy labels, not updating this container",
+				"container", ev.Container, "error", perr)
+		}
+		return
+	}
+	if pol.Notify {
+		u.announceAvailable(ctx, ev, c, newID, "\n(policy: notify) The update is not applied automatically.")
+		return
+	}
+	if !pol.InWindow(u.now().In(time.Local)) {
+		u.log.Debug("outside the update window, postponing", "container", ev.Container, "window", c.Labels[WindowLabel])
 		return
 	}
 	ictx, icancel := context.WithTimeout(ctx, u.apiTimeout)

@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	_ "time/tzdata" // embedded zone database: the scratch image has none, TZ must still work
 
 	"github.com/bilyboy785/docker-image-updater/internal/config"
 	"github.com/bilyboy785/docker-image-updater/internal/docker"
