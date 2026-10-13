@@ -19,6 +19,13 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        # 27 uses the classic image store, 29 the containerd one.
+        dind_image: [docker:27-dind, docker:29-dind]
     steps:
       - uses: actions/checkout@v4
       - run: make test-integration
+        env:
+          DIND_IMAGE: ${{ matrix.dind_image }}

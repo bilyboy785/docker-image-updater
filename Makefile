@@ -1,6 +1,8 @@
 IMAGE ?= docker-image-updater
 VERSION ?= dev
 PKG ?= ./...
+DIND_IMAGE ?= docker:27-dind
+DIND_ARGS ?=
 
 .PHONY: test test-pkg build test-integration
 
@@ -17,5 +19,6 @@ build:
 	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):dev .
 
 # End-to-end test inside an isolated docker:dind daemon (never the developer's Docker daemon).
+# DIND_IMAGE picks the daemon (docker:27-dind: classic image store, docker:29-dind: containerd store).
 test-integration: build
-	IMAGE=$(IMAGE):dev ./test/integration.sh
+	IMAGE=$(IMAGE):dev DIND_IMAGE="$(DIND_IMAGE)" DIND_ARGS="$(DIND_ARGS)" ./test/integration.sh

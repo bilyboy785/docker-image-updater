@@ -5,7 +5,10 @@
 set -euo pipefail
 
 IMAGE="${IMAGE:-docker-image-updater:dev}"
+# DIND_IMAGE selects the daemon under test: docker:27-dind uses the classic image store and
+# docker:29-dind the containerd one. DIND_ARGS are extra dockerd arguments (none needed so far).
 DIND_IMAGE="${DIND_IMAGE:-docker:27-dind}"
+DIND_ARGS="${DIND_ARGS:-}"
 DIND_PORT="${DIND_PORT:-2375}"
 REG_PORT="${REG_PORT:-5005}"
 REG_USER="testuser"
@@ -59,7 +62,7 @@ echo "==> starting isolated docker:dind daemon"
 HOST_DOCKER rm -f -v diu-dind >/dev/null 2>&1 || true
 HOST_DOCKER run -d --privileged --name diu-dind -e DOCKER_TLS_CERTDIR= \
   -p "127.0.0.1:${DIND_PORT}:2375" -p "127.0.0.1:${REG_PORT}:${REG_PORT}" -p "127.0.0.1:${WEB_PORT}:${WEB_PORT}" \
-  "$DIND_IMAGE" >/dev/null
+  "$DIND_IMAGE" $DIND_ARGS >/dev/null
 HOST_ID="$(HOST_DOCKER info --format '{{.ID}}')"
 ready=0
 for _ in $(seq 1 60); do
@@ -70,6 +73,9 @@ if [ "$ready" != 1 ]; then echo "dind did not become ready"; HOST_DOCKER logs di
 
 # From here on every docker command targets the dind daemon.
 export DOCKER_HOST="tcp://127.0.0.1:${DIND_PORT}"
+DRIVER_STATUS="$(docker info --format '{{.DriverStatus}}')"
+if [[ "$DRIVER_STATUS" == *io.containerd.snapshotter* ]]; then STORE=containerd; else STORE=classic; fi
+echo "==> dind image $DIND_IMAGE, server $(docker version --format '{{.Server.Version}}'), image store: $STORE ($DRIVER_STATUS)"
 DIND_ID="$(docker info --format '{{.ID}}')"
 if [ -z "$DIND_ID" ] || [ "$DIND_ID" == "$HOST_ID" ] || docker ps -a --format '{{.Names}}' | grep -q '^diu-dind$'; then
   echo "SAFETY: DOCKER_HOST does not point at the isolated dind daemon, aborting"; exit 1
@@ -98,6 +104,10 @@ EOF
   docker build -q --build-arg VERSION="$1" -t "$REF" "$WORK/img" >/dev/null
   # Push from inside the dind container: its own client has its own config, no credential helper.
   HOST_DOCKER exec -e REF diu-dind docker push -q "$REF" >/dev/null
+  # Replace the locally built image by the one pulled from the registry: with the containerd store
+  # an image keeps its build origin, and a locally built image is (rightly) ignored by the updater.
+  docker rmi "$REF" >/dev/null
+  HOST_DOCKER exec -e REF diu-dind docker pull -q "$REF" >/dev/null
 }
 
 dind_login() {
@@ -177,9 +187,16 @@ docker exec diu-anonv sh -c 'echo persisted > /anonv/marker'
 docker exec diu-anonm sh -c 'echo persisted > /anonm/marker'
 
 echo "==> publishing image v2"
+# Keep v1 under a second name while v2 takes over the tag, then point the tag back at v1: the
+# running containers use v1 and the updater itself must be the one to pull v2 over it, as in real
+# life. (With the containerd store, replacing a tag deletes the image that had it.)
+docker tag "$REF" diu-keep:v1
 build_push 2
 NEW="$(docker image inspect -f '{{.Id}}' "$REF")"
 [ "$OLD" != "$NEW" ] || { echo "v1 and v2 images are identical"; exit 1; }
+docker tag diu-keep:v1 "$REF"
+docker rmi diu-keep:v1 >/dev/null
+assert_eq "the local tag points at v1 again" "$OLD" "$(docker image inspect -f '{{.Id}}' "$REF")"
 
 echo "==> giving the updater its registry credentials through a volume"
 printf '{"auths":{"localhost:%s":{"auth":"%s"}}}\n' "$REG_PORT" "$(printf '%s:%s' "$REG_USER" "$REG_PASS" | base64 | tr -d '\n')" > "$WORK/updater-config.json"
@@ -187,7 +204,9 @@ docker volume create diu-cfg >/dev/null
 docker run --rm -i -v diu-cfg:/config busybox:1.36 sh -c 'cat > /config/config.json' < "$WORK/updater-config.json"
 
 echo "==> starting the updater"
-docker run -d --name diu-updater \
+# The updater image was loaded with docker load: it has no registry origin and, with the
+# containerd image store, cannot be told apart from a pullable image. Exclude it explicitly.
+docker run -d --name diu-updater --label docker-image-updater.enable=false \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v diu-cfg:/config:ro -e DOCKER_CONFIG=/config \
   -p "${WEB_PORT}:8080" \
@@ -233,8 +252,12 @@ assert_contains "compose -p network preserved" "diu-custom_backend" "$(docker in
 assert_eq "locally built container still running" "true" "$(docker inspect -f '{{.State.Running}}' diu-local)"
 assert_eq "locally built container untouched (same id)" "$LOCAL_CID" "$(docker inspect -f '{{.Id}}' diu-local)"
 assert_eq "locally built container keeps its image" "$LOCAL_IMG" "$(docker inspect -f '{{.Image}}' diu-local)"
-assert_eq "updater logs show no failure for the local image" "0" "$(docker logs diu-updater 2>&1 | grep -c 'local-only' || true)"
+assert_eq "updater logs show no failure for the local image" "0" "$(docker logs diu-updater 2>&1 | grep -c 'cannot check image.*local-only' || true)"
+assert_eq "updater never tries to pull the local image" "0" "$(docker logs diu-updater 2>&1 | grep -c 'local-only' || true)"
 assert_contains "no failure is counted" '"failures":0,' "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+SKIPPED="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -o '"skipped":[0-9]*' | cut -d: -f2)"
+# Skipped: the opt-out container, the registry (opt-out) and the local container.
+assert_eq "skipped count covers the opt-out and local containers" "1" "$([ "${SKIPPED:-0}" -ge 3 ] && echo 1 || echo 0)"
 assert_eq "notify-policy container still running" "true" "$(docker inspect -f '{{.State.Running}}' diu-notify)"
 assert_eq "notify-policy container untouched (same id)" "$NOTIFY_CID" "$(docker inspect -f '{{.Id}}' diu-notify)"
 assert_eq "notify-policy container keeps the old image" "$OLD" "$(docker inspect -f '{{.Image}}' diu-notify)"
@@ -274,6 +297,16 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 assert_eq "the forced scan ran (scans count reached 2)" "1" "$scan2"
+STATS2="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+assert_contains "no failure after the forced scan" '"failures":0,' "$STATS2"
+for pair in "diu-local:$LOCAL_CID:$LOCAL_IMG" "diu-notify:$NOTIFY_CID:$OLD" "diu-window:$WINDOW_CID:$OLD"; do
+  IFS=: read -r name cid img <<< "$pair"
+  assert_eq "$name keeps its container id after the forced scan" "$cid" "$(docker inspect -f '{{.Id}}' "$name")"
+  assert_eq "$name keeps its image after the forced scan" "$img" "$(docker inspect -f '{{.Image}}' "$name")"
+done
+assert_eq "diu-notify has exactly one event" "1" "$(grep -o '"container":"diu-notify"' <<< "$STATS2" | wc -l | tr -d ' ')"
+assert_contains "the notify event has the available status" '"status":"available"' "$STATS2"
+assert_eq "diu-window has no event after the forced scan" "0" "$(grep -c 'diu-window' <<< "$STATS2" || true)"
 
 assert_contains "registry credentials enabled at startup" "registry credentials enabled" "$(docker logs diu-updater 2>&1)"
 assert_eq "updater logs never contain the registry password" "0" "$(docker logs diu-updater 2>&1 | grep -c -F "$REG_PASS" || true)"
@@ -284,7 +317,7 @@ assert_eq "stats API never contains the registry password" "0" "$(curl -sf -m 3 
 echo "==> negative check: an updater without credentials cannot pull from the private registry"
 build_push 3
 BEFORE="$(for c in diu-run diu-anonv diu-anonm "$COMPOSE_NEW" "$CUSTOM_NEW"; do docker inspect -f '{{.Id}}' "$c"; done)"
-docker run -d --name diu-updater-noauth \
+docker run -d --name diu-updater-noauth --label docker-image-updater.enable=false \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e CHECK_INTERVAL_MINUTES=60 "$IMAGE" >/dev/null
 NOAUTH_LINE=""

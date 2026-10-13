@@ -86,7 +86,7 @@ Containers that are skipped:
 
 - containers whose image is pinned by digest (`image@sha256:...`);
 - containers opted out with the `docker-image-updater.enable=false` label (see below);
-- containers running a locally built image (compose `build:`, `docker build -t name`, `docker load`): an image that has no registry digest never came from a registry and cannot be pulled, so the whole group is ignored silently, with no pull, no event and no notification, and counted as skipped in the statistics. The check looks at the image of the first container using a given image reference. If the lookup itself fails, a warning is logged once per image and the image is checked normally.
+- containers running a locally built image (compose `build:`, `docker build -t name`, `docker load`), which cannot be pulled and would only produce failed pulls. Such a group is ignored silently (no pull, no event, no notification) and counted as skipped in the statistics. See [Locally built images](#locally-built-images) for how they are recognised.
 
 The updater itself (identified by its hostname or by the `docker-image-updater.self=true` label) is watched and notified about, but it is never recreated: update it manually. Containers started with `--rm` (AutoRemove) are handled the same way, see below.
 
@@ -113,9 +113,26 @@ Other behaviours:
 
 - In dry-run mode, for the updater itself and for containers started with `--rm`, an "update available" notification is sent once per container and new image, until the updater restarts.
 - Containers started with `--rm` (AutoRemove) are never touched: stopping them would make Docker delete them, so no rollback would be possible. The updater only notifies you, and you must update them manually.
+- The configuration of the image a container currently runs is read before the new image is pulled, because some image stores delete an image whose tag a pull replaces.
 - If pulling an image fails (for example a private image or a registry outage), the failure is logged, counted and notified once per image and error, not on every scan.
 - When the updated container is the network provider of other containers (`network_mode: container:X`), the success notification names those containers: they share its network stack and must be restarted or recreated manually.
 - Docker calls have timeouts (1 minute, and 30 minutes for pulls), so a stuck daemon cannot block the scan loop forever.
+
+### Locally built images
+
+An image is considered local, and its containers are skipped, when it never came from a registry. How that is detected depends on the daemon's image store:
+
+- **containerd image store** (the default on recent Docker installs, including Docker Desktop): the image description has an `Identity` section. The image is local when it has build records and no pull record. An image with a pull record, or with an empty `Identity`, is not local.
+- **classic image store**: the image is local when it has no repo digest, which is the case for an image that was built or loaded and never pushed or pulled.
+
+All the distinct images used by the containers of a given image reference are checked, and the group is skipped only if every one of them is local. If any image is not local, or if the check itself fails (a warning is then logged once per image), the image is pulled as usual: skipping by mistake would silently stop updates, so uncertainty always resolves to checking.
+
+Known cases where the result may not be what you expect (the detection is a heuristic, so when in doubt use `docker-image-updater.enable=false` to exclude a container for sure, or push the image to a registry and run it from there):
+
+- A registry image retagged with `docker tag` is still a registry image: it is pulled under its new name, which fails if that name does not exist in a registry (reported once, like any pull failure).
+- Classic store: an image loaded with `docker load` looks local and is skipped. An image built locally and then pushed to your own registry has repo digests afterwards, so it is pulled normally.
+- Containerd store: an image loaded with `docker load` or imported has neither build nor pull records, so it is not recognised as local: the updater tries to pull it and reports the failure once. Exclude such containers with `docker-image-updater.enable=false`.
+- Containerd store: an image built locally keeps its build-only identity even after you push it, so it is skipped even though a newer version may exist in your registry. Pull it from the registry (`docker pull`) before running it, or accept that it is not updated.
 
 ## Private registries
 
@@ -202,7 +219,7 @@ services:
   worker:
     image: ghcr.io/example/worker:latest
     labels:
-      docker-image-updater.window: "22:00-02:00,12:00-13:00"   # ranges may wrap past midnight
+      docker-image-updater.window: "22:00-24:00,00:00-02:00,12:00-13:00"   # several ranges; 24:00 is allowed as an end
   updater:
     image: ghcr.io/bilyboy785/docker-image-updater:latest
     environment:
@@ -211,11 +228,12 @@ services:
 
 Details:
 
-- Times use the 24-hour clock, `HH:MM` zero-padded. The start is inclusive and the end exclusive, so `02:00-05:00` covers 02:00 up to 04:59. A range whose end is before its start wraps past midnight. Spaces around ranges and times are tolerated.
-- The clock is the updater's, in the zone given by the `TZ` environment variable (`UTC` by default).
+- Times use the 24-hour clock, `HH:MM` zero-padded. The start is inclusive and the end exclusive, so `02:00-05:00` covers 02:00 up to 04:59. A range whose end is before its start wraps past midnight. `24:00` is accepted as a range end only, so `22:00-24:00` covers the evening up to midnight. Spaces around ranges and times are tolerated.
+- The clock is the updater's, in the zone given by the `TZ` environment variable (`UTC` by default). If `TZ` names an unknown zone the updater falls back to UTC and logs the warning `TZ value not recognised, using UTC` at startup. Mind daylight saving time: on the day clocks go forward, a window such as `02:00-03:00` does not exist in some zones, so the update is deferred to the next day.
 - Windows are evaluated when a scan finds a newer image. Outside the window nothing happens: no event, no notification, and the update is applied by the first scan that falls inside the window. Make sure the scan interval is short enough to hit your windows. A forced "Scan now" also respects windows.
 - With `notify`, one "Update available" event and one notification are sent per container and new image (until the updater restarts) and the container is never recreated. The window is ignored.
-- Invalid labels (unknown policy, malformed window) fail closed: the container is not updated, a warning is logged once per container and label value, and no notification is sent. Fix the label to resume updates.
+- An empty `policy` label means `auto`. An empty or blank `window` label is an error, as is any malformed range.
+- Invalid labels (unknown policy, malformed window, a typo such as `notfy`) fail closed: the container is not updated, a warning is logged once per container and label values as soon as a scan sees them (even before any update exists), and no notification is sent. Fix the label to resume updates.
 - Dry-run mode stays global and unchanged: it never recreates anything. The updater itself and `--rm` containers are handled as described above, whatever their labels.
 - `docker-image-updater.enable=false` still excludes a container completely.
 
@@ -303,7 +321,7 @@ make build                     # build the image as docker-image-updater:dev
 make test-integration          # end-to-end test
 ```
 
-The integration test runs in an isolated `docker:dind` daemon and never touches the containers of your local Docker daemon. It uses a password-protected local registry, so it also covers private registry credentials. It requires Docker with support for privileged containers.
+The integration test runs in an isolated `docker:dind` daemon and never touches the containers of your local Docker daemon. Set `DIND_IMAGE` to choose the daemon, for example `make test-integration DIND_IMAGE=docker:29-dind`: `docker:27-dind` (the default) uses the classic image store and `docker:29-dind` the containerd one, and CI runs both. It uses a password-protected local registry, so it also covers private registry credentials. It requires Docker with support for privileged containers.
 
 Layout:
 
