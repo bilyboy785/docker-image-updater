@@ -11,6 +11,7 @@ Keeps your running Docker containers up to date: it pulls fresh images on a sche
 - Automatic updates for every running container.
 - Works with containers started by `docker run`, `docker compose` and `docker compose -p`.
 - Periodic check, with the interval set in minutes.
+- Private registry support (GHCR, Docker Hub, self-hosted) through a mounted Docker config file.
 - Telegram notifications (optional).
 - Optional statistics dashboard.
 - Per-container opt-out label.
@@ -42,12 +43,14 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - updater-data:/data
+      # - /path/to/dockerconfig:/config:ro   # optional, see "Private registries"
     environment:
       CHECK_INTERVAL_MINUTES: "60"
       TELEGRAM_BOT_TOKEN: "123456:ABC-your-bot-token"
       TELEGRAM_CHAT_ID: "123456789"
       WEB_ENABLED: "true"
       STATE_FILE: /data/state.json
+      # DOCKER_CONFIG: /config   # optional, see "Private registries"
     ports:
       - "127.0.0.1:8080:8080"
 volumes:
@@ -68,6 +71,7 @@ Every setting can be given as an environment variable or as a command-line flag.
 | `WEB_ADDR`               | `-web-addr`        | `:8080`                 | Listen address of the web server. |
 | `STATE_FILE`             | `-state-file`      | empty                   | File used to persist statistics across restarts. Statistics are not persisted when empty. |
 | `DOCKER_SOCKET`          | `-socket`          | `/var/run/docker.sock`  | Path of the Docker socket. |
+| `DOCKER_CONFIG`          | `-docker-config`   | empty                   | Directory containing a Docker `config.json` with registry credentials. Pulls are anonymous when empty. See [Private registries](#private-registries). |
 
 ## How it works
 
@@ -106,6 +110,50 @@ Other behaviours:
 - If pulling an image fails (for example a private image or a registry outage), the failure is logged, counted and notified once per image and error, not on every scan.
 - When the updated container is the network provider of other containers (`network_mode: container:X`), the success notification names those containers: they share its network stack and must be restarted or recreated manually.
 - Docker calls have timeouts (1 minute, and 30 minutes for pulls), so a stuck daemon cannot block the scan loop forever.
+
+## Private registries
+
+The Docker daemon does not read `~/.docker/config.json` (only the Docker CLI does), so the updater sends the registry credentials itself with every pull. Give it a Docker config file:
+
+1. Create a directory with a `config.json` file (example below).
+2. Mount it read-only into the updater and point `DOCKER_CONFIG` to it:
+
+```bash
+docker run -d --name docker-image-updater --restart unless-stopped \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /path/to/dockerconfig:/config:ro \
+  -e DOCKER_CONFIG=/config \
+  ghcr.io/bilyboy785/docker-image-updater:latest
+```
+
+Example `config.json`, with an entry for GitHub Container Registry and one for Docker Hub:
+
+```json
+{
+  "auths": {
+    "ghcr.io": { "auth": "dXNlcm5hbWU6dG9rZW4=" },
+    "https://index.docker.io/v1/": { "auth": "dXNlcm5hbWU6dG9rZW4=" }
+  }
+}
+```
+
+`auth` is the base64 encoding of `username:token`:
+
+```bash
+echo -n 'username:token' | base64
+```
+
+Entries may also use explicit `username` and `password` fields, or an `identitytoken`. For GHCR, use a personal access token with the `read:packages` scope. For Docker Hub, use an access token. A self-hosted registry is matched by its host and port, for example `registry.example.com:5000`.
+
+Notes:
+
+- Use a token with read-only scope: the updater only pulls.
+- The file contains secrets. Restrict its permissions and mount it read-only, as shown above. The updater never logs the credentials or includes them in notifications.
+- The file is read again on every scan, so a rotated token is picked up without restarting the updater.
+- Registry names are matched case-insensitively, and a `https://` prefix or a path in the key is ignored. `docker.io`, `index.docker.io` and `registry-1.docker.io` all designate Docker Hub.
+- Credential helpers and credential stores (`credsStore`, `credHelpers`) are not supported, because the image contains no helper binaries. On macOS and Windows, `docker login` stores the secrets in the OS keychain (`credsStore`), so the generated `~/.docker/config.json` has no usable `auths` entry: create a dedicated minimal file as shown above instead. When a registry is configured with a helper and has no inline entry, the updater logs a warning once and pulls anonymously.
+- If the file is missing or invalid, the updater logs a warning and pulls anonymously.
+- A pull rejected by the registry (for example `unauthorized`) is reported like any other pull failure, once per image and error.
 
 ## Opting out
 
@@ -159,7 +207,7 @@ Set `WEB_ENABLED=true` to start a small web server (address set by `WEB_ADDR`, `
 
 ## Limitations
 
-- Private registries that need credentials are not supported: images are pulled without registry authentication.
+- Registry credential helpers and credential stores are not supported: put an inline `auth` entry in the Docker config file (see "Private registries").
 - A container using `network_mode: container:X` is not re-linked when `X` is recreated: it is named in the notification and must be restarted manually.
 - Containers started with `--rm` are not updated automatically (see above).
 - Locally built images (compose `build:`, `docker build -t name`) should be opted out with the label: the updater pulls the same name from the registry, which would replace them with a different image or fail.
@@ -181,7 +229,7 @@ make build                     # build the image as docker-image-updater:dev
 make test-integration          # end-to-end test
 ```
 
-The integration test runs in an isolated `docker:dind` daemon and never touches the containers of your local Docker daemon. It requires Docker with support for privileged containers.
+The integration test runs in an isolated `docker:dind` daemon and never touches the containers of your local Docker daemon. It uses a password-protected local registry, so it also covers private registry credentials. It requires Docker with support for privileged containers.
 
 Layout:
 
@@ -189,6 +237,7 @@ Layout:
 - `internal/config`: environment variables and flags.
 - `internal/docker`: minimal Docker Engine API client.
 - `internal/updater`: scan loop, recreation and rollback.
+- `internal/registry`: registry credentials from a Docker config file.
 - `internal/notify`: Telegram notifications.
 - `internal/stats`: statistics and persisted state.
 - `internal/web`: dashboard and API.
