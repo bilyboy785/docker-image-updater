@@ -74,6 +74,10 @@ func main() {
 	log.Info("docker-image-updater started", "version", version, "mode", mode, "interval", cfg.Interval.String())
 	sched.Run(ctx)
 
+	// Restore default signal handling so that a second SIGINT/SIGTERM during
+	// the flush terminates the process.
+	stop()
+
 	// Best-effort flush of pending notifications. main returns normally after
 	// this point (no os.Exit), so nothing skips it.
 	if queue != nil {

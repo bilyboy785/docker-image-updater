@@ -42,6 +42,7 @@ services:
   docker-image-updater:
     image: ghcr.io/bilyboy785/docker-image-updater:latest
     restart: unless-stopped
+    stop_grace_period: 30s   # the scan in progress and the notification flush must fit (docker stop waits 10 s by default)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - updater-data:/data
@@ -197,6 +198,7 @@ Notifications are queued and sent in the background, so a slow or failing Telegr
 - Errors that cannot succeed on retry (for example a wrong chat ID or an invalid message) are logged and the message is dropped.
 - The backlog is bounded to 200 messages. Beyond that the oldest ones are dropped and the next message starts with a notice of how many were dropped.
 - On shutdown, pending messages are flushed on a best-effort basis for up to 10 seconds.
+- Delivery is at-least-once: after an ambiguous network failure a notification may be delivered twice.
 
 Other messages are "Update available" (dry-run, the updater itself and `--rm` containers), "Update failed", "Update failed and was rolled back" and "Cannot check image" (pull failure).
 
