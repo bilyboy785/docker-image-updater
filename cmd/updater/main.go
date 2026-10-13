@@ -35,6 +35,10 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
+	if tzUnrecognised(os.Getenv("TZ"), time.Local.String()) {
+		log.Warn("TZ value not recognised, using UTC", "TZ", os.Getenv("TZ"))
+	}
+
 	mode := "active"
 	if cfg.DryRun {
 		mode = "dry-run"
@@ -84,6 +88,12 @@ func main() {
 	if queue != nil {
 		queue.Close(10 * time.Second)
 	}
+}
+
+// tzUnrecognised reports whether the TZ variable is set to a zone the runtime could not load and
+// silently replaced by UTC.
+func tzUnrecognised(tz, local string) bool {
+	return tz != "" && tz != "UTC" && tz != "Etc/UTC" && local == "UTC"
 }
 
 // triggerScan adapts the scheduler to the web package.

@@ -28,8 +28,9 @@ type fakeDocker struct {
 
 	imageCfg    map[string]any // returned by ImageConfig
 	imageCfgErr error
-	digestCalls int
-	localImages map[string]bool  // image ids with no repo digest (built locally)
+	localChecks int
+	localErr    map[string]error // image id -> error from ImageIsLocal
+	localImages map[string]bool  // image ids that never came from a registry
 	created     []map[string]any // bodies passed to CreateContainer
 }
 
@@ -73,18 +74,15 @@ func (f *fakeDocker) ImageConfig(ctx context.Context, ref string) (map[string]an
 	}
 	return f.imageCfg, f.imageCfgErr
 }
-func (f *fakeDocker) ImageRepoDigests(ctx context.Context, id string) ([]string, error) {
+func (f *fakeDocker) ImageIsLocal(ctx context.Context, id string) (bool, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return false, err
 	}
-	f.digestCalls++
-	if err := f.fail("RepoDigests"); err != nil {
-		return nil, err
+	f.localChecks++
+	if err := f.localErr[id]; err != nil {
+		return false, err
 	}
-	if f.localImages[id] {
-		return nil, nil
-	}
-	return []string{"repo@sha256:feed"}, nil
+	return f.localImages[id], nil
 }
 func (f *fakeDocker) CreateContainer(ctx context.Context, name string, body map[string]any) (string, error) {
 	f.rec("create " + name)

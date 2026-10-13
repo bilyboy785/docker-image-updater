@@ -34,7 +34,7 @@ type DockerAPI interface {
 	PullImage(ctx context.Context, ref, registryAuth string) error
 	ImageID(ctx context.Context, ref string) (string, error)
 	ImageConfig(ctx context.Context, ref string) (map[string]any, error)
-	ImageRepoDigests(ctx context.Context, id string) ([]string, error)
+	ImageIsLocal(ctx context.Context, id string) (bool, error)
 	CreateContainer(ctx context.Context, name string, body map[string]any) (string, error)
 	StartContainer(ctx context.Context, id string) error
 	StopContainer(ctx context.Context, id string) error
@@ -122,6 +122,9 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 			skipped++
 			continue
 		}
+		if _, err := ParsePolicy(c.Labels); err != nil {
+			u.warnBadPolicy(c, err)
+		}
 		watched++
 		if _, ok := groups[c.Image]; !ok {
 			refs = append(refs, c.Image)
@@ -139,6 +142,17 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 	}
 	u.stats.RecordScan(start, time.Since(start), watched, skipped)
 	return ctx.Err()
+}
+
+// warnBadPolicy logs invalid policy labels once per container and label values.
+func (u *Updater) warnBadPolicy(c docker.Container, err error) {
+	key := "policy|" + c.ID + "|" + c.Labels[PolicyLabel] + "|" + c.Labels[WindowLabel]
+	if u.notified[key] {
+		return
+	}
+	u.notified[key] = true
+	u.log.Warn("invalid update policy labels, this container will not be updated",
+		"container", c.Name(), "error", err)
 }
 
 // configImage returns the image reference a container was created with, or "" if unknown or not pullable.
@@ -163,7 +177,7 @@ func (u *Updater) configImage(ctx context.Context, id string) string {
 // full container list of the scan, used to find containers depending on an updated one.
 // It returns the number of containers it skipped because their image was built locally.
 func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.Container) int {
-	if u.isLocalImage(ctx, ref, cs[0]) {
+	if u.isLocalImage(ctx, ref, cs) {
 		return len(cs)
 	}
 	pctx, pcancel := context.WithTimeout(ctx, u.pullTimeout)
@@ -195,26 +209,34 @@ func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.C
 	return 0
 }
 
-// isLocalImage reports whether the image run by c never came from a registry (built locally or
-// loaded from an archive): it has no repo digest and cannot be pulled. The containers of a group
-// share one reference, so the first one is representative. When the lookup fails the image is
-// treated as pullable, so that this check can never block updates.
-func (u *Updater) isLocalImage(ctx context.Context, ref string, c docker.Container) bool {
-	ictx, cancel := context.WithTimeout(ctx, u.apiTimeout)
-	digests, err := u.docker.ImageRepoDigests(ictx, c.ImageID)
-	cancel()
-	if err != nil {
-		if ctx.Err() == nil && !u.notified["digests|"+c.ImageID] {
-			u.notified["digests|"+c.ImageID] = true
-			u.log.Warn("cannot tell whether the image was built locally, checking it anyway",
-				"image", ref, "image_id", shortID(c.ImageID), "error", err)
+// isLocalImage reports whether every image run by the containers of a group never came from a
+// registry (built locally or loaded from an archive) and so cannot be pulled. The group shares one
+// reference but its containers may run different images, so all distinct image ids are checked.
+// When any image is not local, or any lookup fails, the group is treated as pullable: a wrong skip
+// would silently stop updates, while a useless pull only makes noise.
+func (u *Updater) isLocalImage(ctx context.Context, ref string, cs []docker.Container) bool {
+	seen := map[string]bool{}
+	for _, c := range cs {
+		if seen[c.ImageID] {
+			continue
 		}
-		return false
+		seen[c.ImageID] = true
+		ictx, cancel := context.WithTimeout(ctx, u.apiTimeout)
+		local, err := u.docker.ImageIsLocal(ictx, c.ImageID)
+		cancel()
+		if err != nil {
+			if ctx.Err() == nil && !u.notified["image-origin|"+c.ImageID] {
+				u.notified["image-origin|"+c.ImageID] = true
+				u.log.Warn("cannot tell whether the image was built locally, checking it anyway",
+					"image", ref, "image_id", shortID(c.ImageID), "error", err)
+			}
+			return false
+		}
+		if !local {
+			return false
+		}
 	}
-	if len(digests) > 0 {
-		return false
-	}
-	u.log.Debug("ignoring locally built image", "image", ref, "image_id", shortID(c.ImageID))
+	u.log.Debug("ignoring locally built image", "image", ref)
 	return true
 }
 
@@ -277,11 +299,7 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 	pol, perr := ParsePolicy(c.Labels)
 	if perr != nil {
 		// Fail closed: a typo must never turn into an update outside the intended window.
-		if key := "policy|" + c.ID + "|" + c.Labels[PolicyLabel] + "|" + c.Labels[WindowLabel]; !u.notified[key] {
-			u.notified[key] = true
-			u.log.Warn("invalid update policy labels, not updating this container",
-				"container", ev.Container, "error", perr)
-		}
+		u.warnBadPolicy(c, perr)
 		return
 	}
 	if pol.Notify {

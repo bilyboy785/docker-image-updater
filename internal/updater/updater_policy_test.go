@@ -125,15 +125,31 @@ func TestLocalImageIsSkippedSilently(t *testing.T) {
 	}
 }
 
-func TestRepoDigestsFailureFallsBackToPullWithOneWarning(t *testing.T) {
-	f := updatable(nil)
-	f.failOn = map[string]error{"RepoDigests": errors.New("boom")}
+func TestMixedGroupWithOneRegistryImageIsPulled(t *testing.T) {
+	f := &fakeDocker{containers: []docker.Container{
+		web("a", "app:1", "sha256:1", nil), web("b", "app:1", "sha256:3", nil)},
+		info:        map[string]*docker.ContainerInfo{"b": basicInfo("b")},
+		images:      map[string]string{"app:1": "sha256:3"},
+		localImages: map[string]bool{"sha256:1": true}}
+	u, _, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	if !strings.Contains(strings.Join(f.calls, "|"), "pull app:1") || s.Snapshot().Skipped != 0 || s.Snapshot().Watched != 2 {
+		t.Fatalf("%v %+v", f.calls, s.Snapshot())
+	}
+}
+
+func TestOriginLookupFailureFallsBackToPullWithOneWarning(t *testing.T) {
+	f := &fakeDocker{containers: []docker.Container{
+		web("a", "app:1", "sha256:1", nil), web("b", "app:1", "sha256:3", nil)},
+		images:      map[string]string{"app:1": "sha256:1"},
+		localImages: map[string]bool{"sha256:1": true},
+		localErr:    map[string]error{"sha256:3": errors.New("boom")}}
 	u, _, _ := newUpdater(f, false)
 	var buf bytes.Buffer
 	u.log = slog.New(slog.NewTextHandler(&buf, nil))
 	u.RunOnce(context.Background())
 	u.RunOnce(context.Background())
-	if !strings.Contains(strings.Join(f.calls, "|"), "pull nginx:latest") {
+	if !strings.Contains(strings.Join(f.calls, "|"), "pull app:1") {
 		t.Fatalf("must fall back to pulling: %v", f.calls)
 	}
 	if got := strings.Count(buf.String(), "level=WARN"); got != 1 {
@@ -141,11 +157,103 @@ func TestRepoDigestsFailureFallsBackToPullWithOneWarning(t *testing.T) {
 	}
 }
 
-func TestImageWithDigestsFollowsNormalPath(t *testing.T) {
+func TestEachDistinctImageIdIsCheckedOnce(t *testing.T) {
+	f := updatable(nil)
+	f.containers = append(f.containers, web("b", "nginx:latest", "sha256:1", nil))
+	u, _, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	if f.localChecks != 1 || s.Snapshot().Skipped != 0 {
+		t.Fatalf("%d %+v", f.localChecks, s.Snapshot())
+	}
+}
+
+func TestImageWithRegistryOriginFollowsNormalPath(t *testing.T) {
 	f := updatable(nil)
 	u, _, s := newUpdater(f, false)
 	u.RunOnce(context.Background())
-	if f.digestCalls != 1 || s.Snapshot().Updates != 1 || s.Snapshot().Watched != 1 || s.Snapshot().Skipped != 0 {
-		t.Fatalf("%d %+v", f.digestCalls, s.Snapshot())
+	if s.Snapshot().Updates != 1 || s.Snapshot().Watched != 1 || s.Snapshot().Skipped != 0 {
+		t.Fatalf("%+v", s.Snapshot())
+	}
+}
+
+func TestMixedWindowedAndPlainContainersOnOneRef(t *testing.T) {
+	f := &fakeDocker{containers: []docker.Container{
+		web("a", "nginx:latest", "sha256:1", map[string]string{WindowLabel: "02:00-03:00"}),
+		web("b", "nginx:latest", "sha256:1", nil)},
+		info:   map[string]*docker.ContainerInfo{"a": basicInfo("a"), "b": basicInfo("b")},
+		images: map[string]string{"nginx:latest": "sha256:2"}}
+	u, _, s := newUpdater(f, false)
+	clockAt(u, 12, 0)
+	u.RunOnce(context.Background())
+	got := strings.Join(f.calls, "|")
+	if s.Snapshot().Updates != 1 || !strings.Contains(got, "rename b b_old") || strings.Contains(got, "rename a ") {
+		t.Fatalf("%v %+v", f.calls, s.Snapshot())
+	}
+}
+
+func TestBareIDContainerKeepsItsWindowLabels(t *testing.T) {
+	c := web("a", "0123456789ab", "sha256:1", map[string]string{WindowLabel: "02:00-03:00"})
+	info := basicInfo("a")
+	f := &fakeDocker{containers: []docker.Container{c}, info: map[string]*docker.ContainerInfo{"a": info},
+		images: map[string]string{"nginx:latest": "sha256:2"}}
+	u, n, _ := newUpdater(f, false)
+	clockAt(u, 12, 0)
+	u.RunOnce(context.Background())
+	u.RunOnce(context.Background())
+	if hasMutation(f.calls) || len(n.msgs) != 0 {
+		t.Fatalf("a closed window must hold across scans: %v %v", f.calls, n.msgs)
+	}
+	clockAt(u, 2, 30)
+	u.RunOnce(context.Background())
+	if !hasMutation(f.calls) {
+		t.Fatalf("expected an update inside the window: %v", f.calls)
+	}
+}
+
+func TestDryRunWithNotifyAnnouncesOnce(t *testing.T) {
+	f := updatable(map[string]string{PolicyLabel: "notify"})
+	u, n, _ := newUpdater(f, true)
+	u.RunOnce(context.Background())
+	u.RunOnce(context.Background())
+	if hasMutation(f.calls) || len(n.msgs) != 1 {
+		t.Fatalf("%v %v", f.calls, n.msgs)
+	}
+}
+
+func TestAutoRemoveWithClosedWindowStaysSilent(t *testing.T) {
+	f := updatable(map[string]string{WindowLabel: "02:00-03:00"})
+	f.info["a"].HostConfig["AutoRemove"] = true
+	u, n, _ := newUpdater(f, false)
+	clockAt(u, 12, 0)
+	u.RunOnce(context.Background())
+	if hasMutation(f.calls) || len(n.msgs) != 0 {
+		t.Fatalf("%v %v", f.calls, n.msgs)
+	}
+	clockAt(u, 2, 30)
+	u.RunOnce(context.Background())
+	if hasMutation(f.calls) || len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "AutoRemove") {
+		t.Fatalf("inside the window the AutoRemove notice applies: %v %v", f.calls, n.msgs)
+	}
+}
+
+func TestSelfWithInvalidLabelIsStillAnnounced(t *testing.T) {
+	f := updatable(map[string]string{SelfLabel: "true", WindowLabel: "nonsense"})
+	u, n, _ := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	if hasMutation(f.calls) || len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "manual") {
+		t.Fatalf("%v %v", f.calls, n.msgs)
+	}
+}
+
+func TestInvalidLabelsAreReportedEvenWithoutNewImage(t *testing.T) {
+	f := updatable(map[string]string{WindowLabel: "nonsense"})
+	f.images["nginx:latest"] = "sha256:1" // up to date
+	u, n, _ := newUpdater(f, false)
+	var buf bytes.Buffer
+	u.log = slog.New(slog.NewTextHandler(&buf, nil))
+	u.RunOnce(context.Background())
+	u.RunOnce(context.Background())
+	if got := strings.Count(buf.String(), "level=WARN"); got != 1 || len(n.msgs) != 0 {
+		t.Fatalf("%d warnings, %v: %s", got, n.msgs, buf.String())
 	}
 }
