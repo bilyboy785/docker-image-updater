@@ -33,6 +33,8 @@ func TestParsePolicyValid(t *testing.T) {
 		{"two windows", lbl("auto", "02:00-03:00,23:00-23:59"), false, 2},
 		{"spaces everywhere", lbl("", " 02:00 - 03:00 , 23:00-23:59 "), false, 2},
 		{"wrap", lbl("", "22:00-02:00"), false, 1},
+		{"end of day", lbl("", "22:00-24:00"), false, 1},
+		{"whole day", lbl("", "00:00-24:00"), false, 1},
 		{"notify with window", lbl("notify", "01:00-02:00"), true, 1},
 	}
 	for _, tc := range cases {
@@ -66,6 +68,8 @@ func TestParsePolicyInvalid(t *testing.T) {
 		{"three parts", lbl("", "01:00-02:00-03:00"), "window"},
 		{"equal bounds", lbl("", "02:00-02:00"), "window"},
 		{"seconds", lbl("", "02:00:00-03:00:00"), "window"},
+		{"24:00 as start", lbl("", "24:00-02:00"), "window"},
+		{"24:01 as end", lbl("", "22:00-24:01"), "window"},
 	}
 	for _, tc := range cases {
 		_, err := ParsePolicy(tc.labels)
@@ -94,6 +98,10 @@ func TestInWindow(t *testing.T) {
 		{"22:00-02:00", at(0, 0), true},
 		{"22:00-02:00", at(1, 59), true},
 		{"22:00-02:00", at(2, 0), false},
+		{"22:00-24:00", at(21, 59), false},
+		{"22:00-24:00", at(23, 59), true},
+		{"22:00-24:00", at(0, 0), false},
+		{"00:00-24:00", at(13, 0), true},
 		{"02:00-03:00,23:00-23:59", at(2, 30), true},
 		{"02:00-03:00,23:00-23:59", at(23, 30), true},
 		{"02:00-03:00,23:00-23:59", at(12, 0), false},
@@ -107,5 +115,12 @@ func TestInWindow(t *testing.T) {
 		if got := p.InWindow(tc.t); got != tc.want {
 			t.Errorf("%q at %s: got %v", tc.window, tc.t.Format("15:04"), got)
 		}
+	}
+}
+
+func TestParsePolicyErrorsTruncateLongValues(t *testing.T) {
+	_, err := ParsePolicy(lbl("", strings.Repeat("x", 500)))
+	if err == nil || len(err.Error()) > 400 || !strings.Contains(err.Error(), "…") {
+		t.Fatalf("%v", err)
 	}
 }
