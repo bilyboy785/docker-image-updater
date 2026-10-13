@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -63,9 +64,82 @@ func (t *Telegram) Notify(ctx context.Context, text string) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("telegram: status %d: %s", resp.StatusCode, t.redact(strings.TrimSpace(string(msg))))
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return &RateLimitError{RetryAfter: parseRetryAfter(msg, resp.Header.Get("Retry-After"))}
+		}
+		return &StatusError{Code: resp.StatusCode, Body: t.redact(strings.TrimSpace(string(msg)))}
 	}
 	return nil
+}
+
+// Bounds and default of the delay Telegram asks us to wait after an HTTP 429.
+const (
+	defaultRetryAfter = 5 * time.Second
+	minRetryAfter     = time.Second
+	maxRetryAfter     = 10 * time.Minute
+)
+
+// RateLimitError is returned when Telegram answers HTTP 429.
+type RateLimitError struct {
+	// RetryAfter is how long to wait before sending again, clamped to [1s, 10min].
+	RetryAfter time.Duration
+}
+
+// Error never contains the bot token nor the response body.
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("telegram: rate limited, retry after %s", e.RetryAfter)
+}
+
+// StatusError is returned for any other non-200 answer.
+type StatusError struct {
+	Code int
+	Body string // already redacted
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("telegram: status %d: %s", e.Code, e.Body)
+}
+
+// IsRetryable reports whether sending the same message again may succeed:
+// true for rate limits, server errors, timeouts and transport errors, false for
+// other HTTP 4xx answers (bad chat id, invalid HTML, revoked token...).
+func IsRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code < 400 || se.Code >= 500 || se.Code == http.StatusRequestTimeout
+	}
+	return true
+}
+
+// parseRetryAfter reads parameters.retry_after from the JSON body, then the
+// Retry-After header, then falls back to a default; the result is clamped.
+func parseRetryAfter(body []byte, header string) time.Duration {
+	secs, ok := int64(0), false
+	var r struct {
+		Parameters struct {
+			RetryAfter *int64 `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	if json.Unmarshal(body, &r) == nil && r.Parameters.RetryAfter != nil {
+		secs, ok = *r.Parameters.RetryAfter, true
+	} else if n, err := strconv.ParseInt(strings.TrimSpace(header), 10, 64); err == nil {
+		secs, ok = n, true
+	}
+	d := defaultRetryAfter
+	if ok {
+		switch {
+		case secs > int64(maxRetryAfter/time.Second):
+			d = maxRetryAfter
+		case secs < 1:
+			d = minRetryAfter
+		default:
+			d = time.Duration(secs) * time.Second
+		}
+	}
+	return d
 }
 
 func (t *Telegram) redact(s string) string {
