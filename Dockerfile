@@ -10,7 +10,7 @@ COPY . .
 # `docker build --target test .` runs vet + unit tests; the build fails if they fail.
 FROM base AS test
 ENV CGO_ENABLED=0
-RUN go vet ./... && go test ./...
+RUN test -z "$(gofmt -l .)" && go vet ./... && go test ./...
 
 FROM base AS build
 ARG VERSION=dev
