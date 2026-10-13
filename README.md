@@ -31,7 +31,7 @@ Keeps your running Docker containers up to date: it pulls fresh images on a sche
 With `docker run`:
 
 ```bash
-docker run -d --name docker-image-updater --restart unless-stopped --stop-timeout 60 \
+docker run -d --name docker-image-updater --restart unless-stopped --stop-timeout 90 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v updater-data:/data \
   -e CHECK_INTERVAL_MINUTES=60 \
@@ -46,7 +46,7 @@ services:
   docker-image-updater:
     image: ghcr.io/bilyboy785/docker-image-updater:latest
     restart: unless-stopped
-    stop_grace_period: 60s   # the update in progress (a rollback takes up to about 60 s) and the notification flush must fit (docker stop waits 10 s by default)
+    stop_grace_period: 90s   # the update in progress (a rollback takes up to about 60 s) and the notification flush (up to 10 s) must fit (docker stop waits 10 s by default)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - updater-data:/data
@@ -146,7 +146,7 @@ Details:
 - A failed inspection on the very last poll does not fail the gate: the last valid observation is used.
 - A restart count above 0 counts, even if the restart happened before the first observation. The 10 seconds of stability start at the first successful observation.
 - A defective image is not retried: after a gate rollback the updater remembers the pair (container, new image ID) until it restarts, and later scans (including "Scan now") skip that container while the pulled image stays the same, logging "skipping image that previously failed the health gate" without a new event or notification. A different new image ID resets it. Restart the updater to force a retry.
-- Shutdown: if the updater is asked to stop while the gate is running, the gate is abandoned and the update is rolled back at once, with the reason "updater stopping during health gate", so the known-good version is running again quickly. Give the updater a grace period that covers a rollback (about 60 seconds, hence `stop_grace_period: 60s` and `--stop-timeout 60` in the examples above). If the process is killed in the middle of an update (SIGKILL after the grace period, a crash or a power loss), the old container is left stopped as `<name>_old` and the service may be down: start `<name>_old` or recreate the container by hand, then remove the leftover.
+- Shutdown: if the updater is asked to stop while the gate is running, the gate is abandoned and the update is rolled back at once, with the reason "updater stopping during health gate", so the known-good version is running again quickly. Give the updater a grace period that covers a rollback (up to about 60 seconds, plus up to 10 seconds to flush the notifications, hence `stop_grace_period: 90s` and `--stop-timeout 90` in the examples above). If the process is killed in the middle of an update (SIGKILL after the grace period, a crash or a power loss), the old container is left stopped as `<name>_old` and the service may be down: start `<name>_old` or recreate the container by hand, then remove the leftover.
 
 ### Cleaning up old images
 
@@ -243,7 +243,7 @@ services:
 
 ### Update policy and windows
 
-Two more labels control how a container is updated. They are evaluated once per container each time a newer image is found, before anything is renamed or stopped.
+Two more labels control how a container is updated. They are evaluated at every scan, for the container list and the report (an invalid label shows as `skipped`), and again when a newer image is found, before anything is renamed or stopped.
 
 | Label | Values | Default |
 |-------|--------|---------|
@@ -277,9 +277,9 @@ Details:
 - Windows are evaluated when a scan finds a newer image. Outside the window nothing happens: no event, no notification, and the update is applied by the first scan that falls inside the window. Make sure the scan interval is short enough to hit your windows. A forced "Scan now" also respects windows.
 - With `notify`, one "Update available" event and one notification are sent per container and new image (until the updater restarts) and the container is never recreated. The window is ignored.
 - An empty `policy` label means `auto`. An empty or blank `window` label is an error, as is any malformed range.
-- Invalid labels (unknown policy, malformed window, a typo such as `notfy`) fail closed: the container is not updated, a warning is logged once per container and label values as soon as a scan sees them (even before any update exists), and no notification is sent. Fix the label to resume updates.
+- Invalid labels (unknown policy, malformed window, a typo such as `notfy`) fail closed: the container is not updated, a warning is logged once per container and label values as soon as a scan sees them (even before any update exists), and no notification is sent (the updater's own container is still announced). Such a container counts in `watched` (`diu_containers_watched`) but appears as `skipped` in the container list and in `diu_containers`. Fix the label to resume updates.
 - Dry-run mode stays global and unchanged: it never recreates anything. The updater itself and `--rm` containers are handled as described above, whatever their labels.
-- `docker-image-updater.enable=false` still excludes a container completely.
+- `docker-image-updater.enable=false` still excludes a container: it is never updated (and still listed as `skipped` in the dashboard).
 
 ## Telegram setup
 
@@ -333,7 +333,7 @@ The **Containers** section of the page, and the `containers` array of `/api/stat
 | `skipped`          | Not checked: opted out, pinned by digest, image reference that cannot be resolved, locally built image, or invalid policy labels. The detail says which. |
 | `self`             | The updater's own container, which is never updated by itself. |
 
-Each entry also carries the image, its short image id, the policy (`auto` or `notify`), the raw window label and the time of the check.
+Each entry also carries the image, its short image id, the policy (`auto`, `notify` or `invalid`), the window label (cut to 64 characters) and the time of the check.
 
 ### Metrics
 
@@ -420,13 +420,13 @@ Behind a reverse proxy, the proxy must forward the original `Host` header, becau
 
 Release images are signed with [cosign](https://github.com/sigstore/cosign) (keyless, through GitHub's OIDC identity) and ship with a build provenance and an SBOM. Signing starts with v1.2.0: images up to and including v1.1.0 are not signed.
 
-Verify the signature of a tag (replace `v1.2.0` with the version you run):
+Verify the signature of a tag (the image tags have no `v` prefix; replace `1.2.0` with the version you run):
 
 ```bash
 cosign verify \
   --certificate-identity-regexp '^https://github\.com/bilyboy785/docker-image-updater/\.github/workflows/release\.yml@refs/tags/.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/bilyboy785/docker-image-updater:v1.2.0
+  ghcr.io/bilyboy785/docker-image-updater:1.2.0
 ```
 
 The signature is attached to the image digest, so it is valid for every tag that points to it. Pin the digest in your Compose file if you want the exact image you verified.
@@ -434,8 +434,8 @@ The signature is attached to the image digest, so it is valid for every tag that
 The provenance and the SBOM are attached by BuildKit as attestations of the image index (they are not cosign attestations, so `cosign verify-attestation` and `cosign download sbom` do not apply). Inspect them with:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/bilyboy785/docker-image-updater:v1.2.0 --format '{{ json .SBOM }}'
-docker buildx imagetools inspect ghcr.io/bilyboy785/docker-image-updater:v1.2.0 --format '{{ json .Provenance }}'
+docker buildx imagetools inspect ghcr.io/bilyboy785/docker-image-updater:1.2.0 --format '{{ json .SBOM }}'
+docker buildx imagetools inspect ghcr.io/bilyboy785/docker-image-updater:1.2.0 --format '{{ json .Provenance }}'
 ```
 
 The Dockerfile base image and every GitHub Action are pinned by digest or commit SHA, and Dependabot proposes weekly updates for them. CI also runs [govulncheck](https://go.dev/doc/security/vuln/) on every push to `main` and every pull request.
