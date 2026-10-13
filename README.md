@@ -91,7 +91,7 @@ On each scan the updater lists the running containers and, for every distinct im
 Containers that are skipped:
 
 - containers whose image is pinned by digest (`image@sha256:...`);
-- containers opted out with the `docker-image-updater.enable=false` label (see below);
+- containers opted out with the `docker-image-updater.enable=false` label (see below). They are never updated, but they are still listed as `skipped` in the dashboard and in the API (`/api/stats`);
 - containers running a locally built image (compose `build:`, `docker build -t name`, `docker load`), which cannot be pulled and would only produce failed pulls. Such a group is ignored silently (no pull, no event, no notification) and counted as skipped in the statistics. See [Locally built images](#locally-built-images) for how they are recognised.
 
 The updater itself (identified by its hostname or by the `docker-image-updater.self=true` label) is watched and notified about, but it is never recreated: update it manually. Containers started with `--rm` (AutoRemove) are handled the same way, see below.
@@ -366,9 +366,28 @@ scrape_configs:
 
 ### Health endpoint and image healthcheck
 
-`/healthz` answers `200` with `ok` while the scan loop is alive and `503` with a short `stale: ...` text when it is not. The reference time is the end of the last scan completed by this process, or the start of the process while none has completed yet. The updater is healthy while `now - reference <= 2 * interval + 35 minutes` (35 minutes cover the 30 minute pull timeout of a slow scan).
+`/healthz` answers `200` with `ok` while the scan loop is alive and `503` with a short `stale: ...` text when it is not. The reference time is the latest of three moments: the end of the last scan completed by this process, the last progress of the scan in progress (the scan records a heartbeat at its start, around every pull and image lookup, and at every container step) and the start of the process. The updater is healthy while `now - reference <= 2 * interval + 35 minutes` (35 minutes cover the 30 minute pull timeout of one slow step). In other words, `/healthz` reports `stale` only when no scan progress was seen for `2 x interval + 35 minutes`: a long scan that keeps working stays healthy, so an orchestrator that restarts unhealthy containers (autoheal, Swarm) does not restart the updater in the middle of an update, while a scan that is really stuck is reported. The heartbeat is also exposed as `last_progress` in `/api/stats` (never persisted).
 
-The image declares `HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 CMD ["/docker-image-updater","-healthcheck"]`. The `-healthcheck` mode requests `/healthz` on `WEB_ADDR` (`:8080` becomes `127.0.0.1:8080`; a host is kept), with a 3 second timeout, and exits `0` on a `200` and `1` otherwise. When the web server is disabled (`WEB_ENABLED` not true) there is nothing to check and it exits `0` immediately, so `docker ps` shows `healthy` once the container is up. With the web server enabled, `docker ps` shows `(healthy)` after the first probe, one minute after the start.
+The image declares `HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 CMD ["/docker-image-updater","-healthcheck"]`. The `-healthcheck` mode requests `/healthz` on `WEB_ADDR` (`:8080` becomes `127.0.0.1:8080`; a host is kept), with a 3 second timeout, and exits `0` on a `200` and `1` otherwise. When the web server is disabled (`WEB_ENABLED` not true) there is nothing to check and it exits `0` immediately, so there is nothing to fail. Docker only runs the first probe after the first `--interval` though: with the web server disabled `docker ps` shows `health: starting` for the first minute, then `healthy`. With the web server enabled, `docker ps` shows `(healthy)` after the first successful probe, also one minute after the start.
+
+The probe ignores proxy variables (it always talks to the local server directly, so `NO_PROXY` is not needed) and does not follow redirects: anything but a `200` is unhealthy. A configuration error in `-healthcheck` mode also exits `1`.
+
+The image `HEALTHCHECK` reads environment variables only, never command-line flags. If you configure the updater with flags such as `-web-addr :9090`, the probe still targets `WEB_ADDR` (`:8080` by default) and would report the container unhealthy. Override the healthcheck in compose so that it gets the same flags:
+
+```yaml
+services:
+  docker-image-updater:
+    image: ghcr.io/bilyboy785/docker-image-updater:latest
+    command: ["-web", "true", "-web-addr", ":9090"]
+    healthcheck:
+      test: ["CMD", "/docker-image-updater", "-healthcheck", "-web", "true", "-web-addr", ":9090"]
+      interval: 60s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+```
+
+Setting `WEB_ENABLED` and `WEB_ADDR` as environment variables instead needs no override.
 
 **`/metrics`, `/api/stats` and the page have no authentication**, like the rest of the dashboard: see the note below.
 
