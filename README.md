@@ -190,6 +190,14 @@ Image: nginx:latest
 1a2b3c4d5e6f → 7a8b9c0d1e2f
 ```
 
+Notifications are queued and sent in the background, so a slow or failing Telegram never blocks or fails a scan:
+
+- Requests are rate limited to about one every 1.2 seconds. During a burst (for example several updates in one scan), pending messages are merged into fewer messages, separated by a blank line, up to 4000 characters per message. Longer messages are truncated.
+- When Telegram answers with a rate limit error, the `retry_after` delay it gives is honoured. Temporary errors (network, server) are retried up to 5 times with an increasing delay.
+- Errors that cannot succeed on retry (for example a wrong chat ID or an invalid message) are logged and the message is dropped.
+- The backlog is bounded to 200 messages. Beyond that the oldest ones are dropped and the next message starts with a notice of how many were dropped.
+- On shutdown, pending messages are flushed on a best-effort basis for up to 10 seconds.
+
 Other messages are "Update available" (dry-run, the updater itself and `--rm` containers), "Update failed", "Update failed and was rolled back" and "Cannot check image" (pull failure).
 
 ## Web dashboard

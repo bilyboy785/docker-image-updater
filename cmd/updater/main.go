@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/bilyboy785/docker-image-updater/internal/config"
 	"github.com/bilyboy785/docker-image-updater/internal/docker"
@@ -43,8 +44,10 @@ func main() {
 	}
 
 	var notifier notify.Notifier = notify.Nop{}
+	var queue *notify.Queue
 	if cfg.TelegramToken != "" {
-		notifier = notify.NewTelegram(cfg.TelegramToken, cfg.TelegramChat)
+		queue = notify.NewQueue(notify.NewTelegram(cfg.TelegramToken, cfg.TelegramChat), log)
+		notifier = queue
 	}
 
 	host, _ := os.Hostname()
@@ -70,6 +73,12 @@ func main() {
 
 	log.Info("docker-image-updater started", "version", version, "mode", mode, "interval", cfg.Interval.String())
 	sched.Run(ctx)
+
+	// Best-effort flush of pending notifications. main returns normally after
+	// this point (no os.Exit), so nothing skips it.
+	if queue != nil {
+		queue.Close(10 * time.Second)
+	}
 }
 
 // triggerScan adapts the scheduler to the web package.
