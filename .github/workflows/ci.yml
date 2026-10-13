@@ -36,9 +36,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          # The latest stable Go: Go 1.23 is end of life and its standard library has
-          # known, unfixed vulnerabilities, which would drown out findings in our own code.
-          go-version: stable
+          # The Go version of go.mod, kept on a supported release: the binary embeds the standard
+          # library it is built with, so an end of life Go would report its known vulnerabilities.
+          go-version-file: go.mod
       # Pinned for reproducibility; Dependabot does not track this line, bump it manually.
       - run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
       - run: govulncheck ./...

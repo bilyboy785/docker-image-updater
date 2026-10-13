@@ -1,3 +1,3 @@
 module github.com/bilyboy785/docker-image-updater
 
-go 1.23
+go 1.27

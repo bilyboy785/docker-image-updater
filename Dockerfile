@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# golang:1.23-alpine (multi-arch index digest, bumped by Dependabot)
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine@sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f AS base
+# golang:1.27-alpine (multi-arch index digest, bumped by Dependabot)
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS base
 RUN apk add --no-cache ca-certificates
 WORKDIR /src
 COPY go.mod ./
