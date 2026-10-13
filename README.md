@@ -16,7 +16,8 @@ Keeps your running Docker containers up to date: it pulls fresh images on a sche
 - Private registry support (GHCR, Docker Hub, self-hosted) through a mounted Docker config file.
 - Telegram notifications (optional).
 - Optional statistics dashboard, with a button to force a scan.
-- Per-container opt-out label.
+- Per-container opt-out label, update policy (`auto` or `notify`) and update time windows.
+- Locally built images are ignored silently.
 - Dry-run mode: only notify, never recreate.
 - Automatic rollback when an update fails.
 - Tiny `scratch` image (about 3 MB), multi-arch (`linux/amd64`, `linux/arm64`).
@@ -74,6 +75,7 @@ Every setting can be given as an environment variable or as a command-line flag.
 | `WEB_ADDR`               | `-web-addr`        | `:8080`                 | Listen address of the web server. |
 | `STATE_FILE`             | `-state-file`      | empty                   | File used to persist statistics across restarts. Statistics are not persisted when empty. |
 | `DOCKER_SOCKET`          | `-socket`          | `/var/run/docker.sock`  | Path of the Docker socket. |
+| `TZ`                     | none               | `UTC`                   | Time zone used to evaluate update windows, for example `Europe/Paris`. The zone database is embedded in the binary. See [Update policy and windows](#update-policy-and-windows). |
 | `DOCKER_CONFIG`          | `-docker-config`   | empty                   | Directory containing a Docker `config.json` with registry credentials. Pulls are anonymous when empty. See [Private registries](#private-registries). |
 
 ## How it works
@@ -83,7 +85,8 @@ On each scan the updater lists the running containers and, for every distinct im
 Containers that are skipped:
 
 - containers whose image is pinned by digest (`image@sha256:...`);
-- containers opted out with the `docker-image-updater.enable=false` label (see below).
+- containers opted out with the `docker-image-updater.enable=false` label (see below);
+- containers running a locally built image (compose `build:`, `docker build -t name`, `docker load`): an image that has no registry digest never came from a registry and cannot be pulled, so the whole group is ignored silently, with no pull, no event and no notification, and counted as skipped in the statistics. The check looks at the image of the first container using a given image reference. If the lookup itself fails, a warning is logged once per image and the image is checked normally.
 
 The updater itself (identified by its hostname or by the `docker-image-updater.self=true` label) is watched and notified about, but it is never recreated: update it manually. Containers started with `--rm` (AutoRemove) are handled the same way, see below.
 
@@ -177,6 +180,45 @@ services:
       docker-image-updater.enable: "false"
 ```
 
+### Update policy and windows
+
+Two more labels control how a container is updated. They are evaluated once per container each time a newer image is found, before anything is renamed or stopped.
+
+| Label | Values | Default |
+|-------|--------|---------|
+| `docker-image-updater.policy` | `auto`: recreate the container. `notify`: only report that an update is available. | `auto` |
+| `docker-image-updater.window` | One or more `HH:MM-HH:MM` ranges separated by commas, for example `02:00-05:00` or `02:00-03:00,23:00-23:59`. | any time |
+
+```yaml
+services:
+  database:
+    image: postgres:16
+    labels:
+      docker-image-updater.policy: "notify"   # never recreated, you are told when an update exists
+  web:
+    image: nginx:latest
+    labels:
+      docker-image-updater.window: "02:00-05:00"   # updated at night only
+  worker:
+    image: ghcr.io/example/worker:latest
+    labels:
+      docker-image-updater.window: "22:00-02:00,12:00-13:00"   # ranges may wrap past midnight
+  updater:
+    image: ghcr.io/bilyboy785/docker-image-updater:latest
+    environment:
+      TZ: Europe/Paris   # windows are evaluated in this zone, UTC when unset
+```
+
+Details:
+
+- Times use the 24-hour clock, `HH:MM` zero-padded. The start is inclusive and the end exclusive, so `02:00-05:00` covers 02:00 up to 04:59. A range whose end is before its start wraps past midnight. Spaces around ranges and times are tolerated.
+- The clock is the updater's, in the zone given by the `TZ` environment variable (`UTC` by default).
+- Windows are evaluated when a scan finds a newer image. Outside the window nothing happens: no event, no notification, and the update is applied by the first scan that falls inside the window. Make sure the scan interval is short enough to hit your windows. A forced "Scan now" also respects windows.
+- With `notify`, one "Update available" event and one notification are sent per container and new image (until the updater restarts) and the container is never recreated. The window is ignored.
+- Invalid labels (unknown policy, malformed window) fail closed: the container is not updated, a warning is logged once per container and label value, and no notification is sent. Fix the label to resume updates.
+- Dry-run mode stays global and unchanged: it never recreates anything. The updater itself and `--rm` containers are handled as described above, whatever their labels.
+- `docker-image-updater.enable=false` still excludes a container completely.
+
 ## Telegram setup
 
 1. Open a chat with [@BotFather](https://t.me/BotFather) on Telegram, send `/newbot` and follow the steps. BotFather gives you a bot token.
@@ -200,7 +242,7 @@ Notifications are queued and sent in the background, so a slow or failing Telegr
 - On shutdown, pending messages are flushed on a best-effort basis for up to 10 seconds.
 - Delivery is at-least-once: after an ambiguous network failure a notification may be delivered twice.
 
-Other messages are "Update available" (dry-run, the updater itself and `--rm` containers), "Update failed", "Update failed and was rolled back" and "Cannot check image" (pull failure).
+Other messages are "Update available" (dry-run, `notify` policy, the updater itself and `--rm` containers), "Update failed", "Update failed and was rolled back" and "Cannot check image" (pull failure).
 
 ## Web dashboard
 
@@ -243,7 +285,6 @@ Behind a reverse proxy, the proxy must forward the original `Host` header, becau
 - Registry credential helpers and credential stores are not supported: put an inline `auth` entry in the Docker config file (see "Private registries").
 - A container using `network_mode: container:X` is not re-linked when `X` is recreated: it is named in the notification and must be restarted manually.
 - Containers started with `--rm` are not updated automatically (see above).
-- Locally built images (compose `build:`, `docker build -t name`) should be opted out with the label: the updater pulls the same name from the registry, which would replace them with a different image or fail.
 - Containers attached to several networks need Docker Engine API 1.44 or later (Docker 25+).
 - Ordering between containers (`depends_on`) is not handled.
 - The updater never updates itself, it only notifies.

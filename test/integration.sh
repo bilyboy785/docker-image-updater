@@ -145,6 +145,25 @@ RM_ID="$(docker inspect -f '{{.Id}}' diu-rm)"
 docker run -d --name diu-optout --label docker-image-updater.enable=false "$REF" >/dev/null
 docker run -d --name diu-anonv -v /anonv "$REF" >/dev/null
 docker run -d --name diu-anonm --mount type=volume,dst=/anonm "$REF" >/dev/null
+# Locally built image: it has no registry digest and cannot be pulled, so it must be ignored silently.
+mkdir -p "$WORK/local"
+cat > "$WORK/local/Dockerfile" <<'EOF'
+FROM busybox:1.36
+CMD ["sh", "-c", "trap 'exit 0' TERM; : local-only; while :; do sleep 1; done"]
+EOF
+docker build -q -t local-only:1 "$WORK/local" >/dev/null
+docker run -d --name diu-local local-only:1 >/dev/null
+LOCAL_CID="$(docker inspect -f '{{.Id}}' diu-local)"
+LOCAL_IMG="$(docker inspect -f '{{.Image}}' diu-local)"
+# Policy labels. The window is 2 to 3 hours ahead of the current UTC time (the updater runs in UTC).
+docker run -d --name diu-notify --label docker-image-updater.policy=notify "$REF" >/dev/null
+NOTIFY_CID="$(docker inspect -f '{{.Id}}' diu-notify)"
+NOW_MIN=$((10#$(date -u +%H) * 60 + 10#$(date -u +%M)))
+WIN_START=$(((NOW_MIN + 120) % 1440))
+WIN_END=$(((NOW_MIN + 180) % 1440))
+WINDOW="$(printf '%02d:%02d-%02d:%02d' $((WIN_START / 60)) $((WIN_START % 60)) $((WIN_END / 60)) $((WIN_END % 60)))"
+docker run -d --name diu-window --label "docker-image-updater.window=$WINDOW" "$REF" >/dev/null
+WINDOW_CID="$(docker inspect -f '{{.Id}}' diu-window)"
 quiet docker compose -p diu-compose -f "$WORK/compose.yml" up -d
 quiet docker compose -p diu-custom -f "$WORK/compose.yml" up -d
 
@@ -211,6 +230,19 @@ assert_eq "anonymous -v volume data survives" "persisted" "$(docker exec diu-ano
 assert_eq "anonymous --mount volume data survives" "persisted" "$(docker exec diu-anonm cat /anonm/marker)"
 assert_contains "compose network preserved" "diu-compose_backend" "$(docker inspect -f '{{json .NetworkSettings.Networks}}' "$COMPOSE_NEW")"
 assert_contains "compose -p network preserved" "diu-custom_backend" "$(docker inspect -f '{{json .NetworkSettings.Networks}}' "$CUSTOM_NEW")"
+assert_eq "locally built container still running" "true" "$(docker inspect -f '{{.State.Running}}' diu-local)"
+assert_eq "locally built container untouched (same id)" "$LOCAL_CID" "$(docker inspect -f '{{.Id}}' diu-local)"
+assert_eq "locally built container keeps its image" "$LOCAL_IMG" "$(docker inspect -f '{{.Image}}' diu-local)"
+assert_eq "updater logs show no failure for the local image" "0" "$(docker logs diu-updater 2>&1 | grep -c 'local-only' || true)"
+assert_contains "no failure is counted" '"failures":0,' "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+assert_eq "notify-policy container still running" "true" "$(docker inspect -f '{{.State.Running}}' diu-notify)"
+assert_eq "notify-policy container untouched (same id)" "$NOTIFY_CID" "$(docker inspect -f '{{.Id}}' diu-notify)"
+assert_eq "notify-policy container keeps the old image" "$OLD" "$(docker inspect -f '{{.Image}}' diu-notify)"
+assert_contains "notify-policy update is reported as available" "diu-notify" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+assert_eq "closed-window container still running" "true" "$(docker inspect -f '{{.State.Running}}' diu-window)"
+assert_eq "closed-window container untouched (same id)" "$WINDOW_CID" "$(docker inspect -f '{{.Id}}' diu-window)"
+assert_eq "closed-window container keeps the old image" "$OLD" "$(docker inspect -f '{{.Image}}' diu-window)"
+assert_eq "closed-window container is not reported" "0" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -c 'diu-window' || true)"
 assert_eq "no leftover _old container" "0" "$(docker ps -a --format '{{.Names}}' | grep -c '_old$' || true)"
 assert_eq "updater still running" "true" "$(docker inspect -f '{{.State.Running}}' diu-updater)"
 quiet docker compose -p diu-compose -f "$WORK/compose.yml" up -d
