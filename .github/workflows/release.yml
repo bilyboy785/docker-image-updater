@@ -32,8 +32,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        env:
+          # Also annotate the multi-arch index: GitHub Packages reads the description from there.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
           images: ${{ env.IMAGE }}
+          # Without this the description label would come from the (possibly empty) repository
+          # description and override the one set in the Dockerfile.
+          labels: |
+            org.opencontainers.image.title=docker-image-updater
+            org.opencontainers.image.description=Automatically updates running Docker containers when a newer image is available, with health-gated rollback, Telegram notifications and a status dashboard
+          annotations: |
+            org.opencontainers.image.title=docker-image-updater
+            org.opencontainers.image.description=Automatically updates running Docker containers when a newer image is available, with health-gated rollback, Telegram notifications and a status dashboard
           # `latest`, `major` and `major.minor` only for stable releases: never for a release marked
           # as a pre-release on GitHub, nor for a tag with a suffix (-rc.1, -beta, ...).
           # The exact version tag is always published.
@@ -52,6 +63,7 @@ jobs:
           build-args: VERSION=${{ github.event.release.tag_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
           provenance: mode=max
           sbom: true
       - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
