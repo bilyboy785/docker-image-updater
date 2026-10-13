@@ -12,8 +12,9 @@ import (
 )
 
 // staleness returns "" when the scan loop looks alive and a short "stale: ..." text when it does
-// not. The reference time is the end of the last completed scan, but never earlier than the
-// process start: a scan restored from the state file says nothing about this process.
+// not. The reference time is the latest of the end of the last completed scan, the last scan
+// progress heartbeat and the process start: a scan restored from the state file says nothing
+// about this process, and a long scan that keeps working is alive.
 func (o options) staleness(snap stats.Snapshot, now time.Time) string {
 	if o.interval <= 0 {
 		return ""
@@ -24,6 +25,9 @@ func (o options) staleness(snap stats.Snapshot, now time.Time) string {
 		if end := snap.LastScan.Add(time.Duration(snap.LastScanMs) * time.Millisecond); end.After(ref) {
 			ref, what = end, "last scan completed"
 		}
+	}
+	if snap.LastProgress.After(ref) {
+		ref, what = snap.LastProgress, "last scan progress"
 	}
 	if ref.IsZero() {
 		return ""

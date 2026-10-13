@@ -134,3 +134,37 @@ func TestLocalAddr(t *testing.T) {
 		t.Error("an address without a port must be rejected")
 	}
 }
+
+func TestHealthzALongScanThatKeepsProgressingStaysHealthy(t *testing.T) {
+	start := time.Unix(1_000_000, 0)
+	// The last scan ended long ago, but the scan in progress touched the heartbeat a minute ago.
+	snap := stats.Snapshot{StartedAt: start, Scans: 3, LastScan: start.Add(time.Hour), LastScanMs: 1000, Scanning: true}
+	now := start.Add(10 * time.Hour)
+	snap.LastProgress = now.Add(-time.Minute)
+	if rec := healthAt(t, snap, now); rec.Code != 200 || rec.Body.String() != "ok" {
+		t.Fatalf("progressing scan: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHealthzAStuckScanGoesStaleFromItsLastProgress(t *testing.T) {
+	start := time.Unix(1_000_000, 0)
+	progress := start.Add(2 * time.Hour)
+	snap := stats.Snapshot{StartedAt: start, Scans: 3, LastScan: start.Add(time.Hour), LastScanMs: 1000, Scanning: true, LastProgress: progress}
+	if rec := healthAt(t, snap, progress.Add(hLimit)); rec.Code != 200 {
+		t.Fatalf("just inside: %d %q", rec.Code, rec.Body.String())
+	}
+	rec := healthAt(t, snap, progress.Add(hLimit+time.Second))
+	if rec.Code != 503 || !strings.HasPrefix(rec.Body.String(), "stale: ") || !strings.Contains(rec.Body.String(), "progress") {
+		t.Fatalf("just outside: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHealthzAProgressOlderThanTheLastScanIsIgnored(t *testing.T) {
+	start := time.Unix(1_000_000, 0)
+	scan := start.Add(time.Hour)
+	end := scan.Add(time.Second)
+	snap := stats.Snapshot{StartedAt: start, Scans: 1, LastScan: scan, LastScanMs: 1000, LastProgress: scan.Add(-time.Minute)}
+	if rec := healthAt(t, snap, end.Add(hLimit+time.Millisecond)); rec.Code != 503 || !strings.Contains(rec.Body.String(), "last scan completed") {
+		t.Fatalf("%d %q", rec.Code, rec.Body.String())
+	}
+}

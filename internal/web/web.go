@@ -72,8 +72,8 @@ type options struct {
 }
 
 // WithHealth makes /healthz report 503 when the scan loop looks dead: no scan completed within
-// two scan intervals plus staleSlack (the time reserved for a slow scan) of the last scan's end,
-// or of the process start while no scan has completed yet. Without it /healthz always answers 200.
+// two scan intervals plus staleSlack (the time reserved for a slow step) of the last sign of life:
+// the end of the last scan, the last progress of the scan in progress, or the process start. Without it /healthz always answers 200.
 func WithHealth(interval time.Duration) Option {
 	return func(o *options) { o.interval = interval }
 }
