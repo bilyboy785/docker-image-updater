@@ -13,7 +13,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: make test
 
   integration:
@@ -25,7 +25,7 @@ jobs:
         # 27 uses the classic image store, 29 the containerd one.
         dind_image: [docker:27-dind, docker:29-dind]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: make test-integration
         env:
           DIND_IMAGE: ${{ matrix.dind_image }}
