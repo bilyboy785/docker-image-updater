@@ -35,6 +35,7 @@ type DockerAPI interface {
 	ImageID(ctx context.Context, ref string) (string, error)
 	ImageConfig(ctx context.Context, ref string) (map[string]any, error)
 	ImageIsLocal(ctx context.Context, id string) (bool, error)
+	RemoveImage(ctx context.Context, id string) error
 	CreateContainer(ctx context.Context, name string, body map[string]any) (string, error)
 	StartContainer(ctx context.Context, id string) error
 	StopContainer(ctx context.Context, id string) error
@@ -64,6 +65,8 @@ type Updater struct {
 	apiTimeout  time.Duration
 	pullTimeout time.Duration
 
+	cleanupImages bool // remove the previous image after a successful update
+
 	healthWait time.Duration // post-start health gate duration; 0 disables it
 	hnow       func() time.Time
 	hsleep     func(ctx context.Context, d time.Duration)
@@ -75,6 +78,13 @@ func New(d DockerAPI, n notify.Notifier, s *stats.Stats, selfID string, dryRun b
 	return &Updater{docker: d, notifier: n, stats: s, selfID: selfID, dryRun: dryRun, log: log, notified: map[string]bool{}, now: time.Now,
 		apiTimeout: defaultAPITimeout, pullTimeout: defaultPullTimeout,
 		hnow: time.Now, hsleep: sleepCtx}
+}
+
+// WithCleanupImages makes the updater remove the previous image after a successful update
+// (best effort) and returns the updater.
+func (u *Updater) WithCleanupImages(on bool) *Updater {
+	u.cleanupImages = on
+	return u
 }
 
 // WithRegistryAuth sets the provider of registry credentials used for pulls (nil: anonymous)
@@ -474,9 +484,14 @@ func (u *Updater) recreate(ctx context.Context, c docker.Container, info *docker
 		st, e := u.rollback(opctx, c, name, newID, gerr)
 		return st, "", e
 	}
+	oldRemoved := true
 	if err := u.docker.RemoveContainer(opctx, c.ID, false); err != nil {
+		oldRemoved = false
 		u.log.Warn("could not remove old container", "container", name+"_old", "error", err)
 		warn = fmt.Sprintf("Warning: the old container %s_old could not be removed and must be removed manually.", name)
+	}
+	if u.cleanupImages && oldRemoved {
+		u.cleanupImage(opctx, name, c.ImageID, newImageID)
 	}
 	if note != "" {
 		if warn != "" {
@@ -485,6 +500,26 @@ func (u *Updater) recreate(ctx context.Context, c docker.Container, info *docker
 		warn += note
 	}
 	return stats.StatusUpdated, warn, nil
+}
+
+// cleanupImage removes the image the replaced container ran, best effort: the daemon refuses
+// (409) while another container still uses it, and the image may already be gone (404).
+func (u *Updater) cleanupImage(ctx context.Context, container, oldID, newID string) {
+	if oldID == "" || oldID == newID {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, u.apiTimeout)
+	defer cancel()
+	err := u.docker.RemoveImage(rctx, oldID)
+	var ae *docker.APIError
+	switch {
+	case err == nil:
+		u.log.Info("removed old image", "container", container, "image_id", shortID(oldID))
+	case errors.As(err, &ae) && (ae.Status == 404 || ae.Status == 409):
+		u.log.Debug("old image not removed", "container", container, "image_id", shortID(oldID), "reason", ae.Message)
+	default:
+		u.log.Warn("cannot remove old image", "container", container, "image_id", shortID(oldID), "error", err)
+	}
 }
 
 // rollback restores the old container. It uses a context detached from cancellation so that a

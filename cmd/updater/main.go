@@ -57,7 +57,7 @@ func main() {
 
 	host, _ := os.Hostname()
 	creds := registry.NewStore(cfg.DockerConfig, func(msg string) { log.Warn(msg) })
-	u := updater.New(docker.New(cfg.Socket), notifier, st, host, cfg.DryRun, log).WithRegistryAuth(creds).WithHealthWait(cfg.HealthWait)
+	u := updater.New(docker.New(cfg.Socket), notifier, st, host, cfg.DryRun, log).WithRegistryAuth(creds).WithHealthWait(cfg.HealthWait).WithCleanupImages(cfg.CleanupImages)
 	if cfg.DockerConfig != "" {
 		log.Info("registry credentials enabled", "config_dir", cfg.DockerConfig)
 	}

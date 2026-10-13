@@ -20,6 +20,9 @@ func TestDefaults(t *testing.T) {
 	if c.Interval != 60*time.Minute || c.Socket != "/var/run/docker.sock" || c.WebAddr != ":8080" {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
+	if c.CleanupImages {
+		t.Fatal("cleanup must be off by default")
+	}
 	if c.HealthWait != 60*time.Second {
 		t.Fatalf("health wait default: %v", c.HealthWait)
 	}
@@ -40,11 +43,12 @@ func TestFromEnv(t *testing.T) {
 		"DOCKER_SOCKET":          "/tmp/d.sock",
 		"DOCKER_CONFIG":          " /config ",
 		"HEALTH_WAIT_SECONDS":    "45",
+		"CLEANUP_IMAGES":         "true",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock", "/config", 45 * time.Second}
+	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock", "/config", true, 45 * time.Second}
 	if c != want {
 		t.Fatalf("got %+v want %+v", c, want)
 	}
@@ -75,6 +79,7 @@ func TestInvalid(t *testing.T) {
 		"token only":     {"TELEGRAM_BOT_TOKEN": "tok"},
 		"chat only":      {"TELEGRAM_CHAT_ID": "42"},
 		"bad bool":       {"DRY_RUN": "maybe"},
+		"bad cleanup":    {"CLEANUP_IMAGES": "later"},
 		"empty web addr": {"WEB_ENABLED": "true", "WEB_ADDR": " "},
 		"negative wait":  {"HEALTH_WAIT_SECONDS": "-1"},
 		"wait too long":  {"HEALTH_WAIT_SECONDS": "601"},
@@ -101,7 +106,7 @@ func TestHelpRequested(t *testing.T) {
 func TestUsageListsFlagsEnvVarsAndDefaults(t *testing.T) {
 	u := Usage()
 	for _, want := range []string{"-interval", "CHECK_INTERVAL_MINUTES", "-telegram-token", "TELEGRAM_BOT_TOKEN",
-		"-dry-run", "DRY_RUN", "-web-addr", "WEB_ADDR", "-state-file", "STATE_FILE", "-socket", "DOCKER_SOCKET", "-docker-config", "DOCKER_CONFIG", "-health-wait", "HEALTH_WAIT_SECONDS", "/var/run/docker.sock", "60"} {
+		"-dry-run", "DRY_RUN", "-web-addr", "WEB_ADDR", "-state-file", "STATE_FILE", "-socket", "DOCKER_SOCKET", "-docker-config", "DOCKER_CONFIG", "-health-wait", "HEALTH_WAIT_SECONDS", "-cleanup-images", "CLEANUP_IMAGES", "/var/run/docker.sock", "60"} {
 		if !strings.Contains(u, want) {
 			t.Errorf("usage is missing %q:\n%s", want, u)
 		}
@@ -129,5 +134,12 @@ func TestHealthWaitBounds(t *testing.T) {
 	}
 	if c, err := Load([]string{"-health-wait", "5"}, env(map[string]string{"HEALTH_WAIT_SECONDS": "30"})); err != nil || c.HealthWait != 5*time.Second {
 		t.Errorf("flag must override env: %v %v", c.HealthWait, err)
+	}
+}
+
+func TestCleanupImagesFlagOverridesEnv(t *testing.T) {
+	c, err := Load([]string{"-cleanup-images=false"}, env(map[string]string{"CLEANUP_IMAGES": "true"}))
+	if err != nil || c.CleanupImages {
+		t.Fatalf("%+v %v", c, err)
 	}
 }

@@ -36,6 +36,7 @@ type fakeDocker struct {
 	created          []map[string]any                           // bodies passed to CreateContainer
 	inspectNew       func(n int) (*docker.ContainerInfo, error) // optional: inspect results of the new container (n counts from 1)
 	inspectNewCalls  int
+	rmiErr           error // returned by RemoveImage
 }
 
 func (f *fakeDocker) rec(s string)        { f.calls = append(f.calls, s) }
@@ -145,6 +146,14 @@ func (f *fakeDocker) ConnectNetwork(ctx context.Context, network, id string, _ m
 		return err
 	}
 	return f.fail("Connect")
+}
+
+func (f *fakeDocker) RemoveImage(ctx context.Context, id string) error {
+	f.rec("rmi " + id)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.rmiErr
 }
 
 type fakeNotifier struct{ msgs []string }
