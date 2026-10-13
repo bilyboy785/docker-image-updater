@@ -56,11 +56,11 @@ volumes:
 
 ## Configuration
 
-Every setting can be given as an environment variable or as a command-line flag. A flag overrides the environment variable.
+Every setting can be given as an environment variable or as a command-line flag. A flag overrides the environment variable. Run with `-h` (or `-help`) to print the flags, their environment variables and defaults.
 
 | Environment variable     | Flag               | Default                 | Description |
 |--------------------------|--------------------|-------------------------|-------------|
-| `CHECK_INTERVAL_MINUTES` | `-interval`        | `60`                    | Time between two scans, in minutes (integer, at least 1). |
+| `CHECK_INTERVAL_MINUTES` | `-interval`        | `60`                    | Time between two scans, in minutes (integer from 1 to 525600, one year). |
 | `TELEGRAM_BOT_TOKEN`     | `-telegram-token`  | empty                   | Telegram bot token. Notifications are disabled when empty. |
 | `TELEGRAM_CHAT_ID`       | `-telegram-chat`   | empty                   | Telegram chat ID. Must be set together with the token. |
 | `DRY_RUN`                | `-dry-run`         | `false`                 | Only notify about available updates, never recreate containers. |
@@ -76,8 +76,9 @@ On each scan the updater lists the running containers and, for every distinct im
 Containers that are skipped:
 
 - containers whose image is pinned by digest (`image@sha256:...`);
-- containers opted out with the `docker-image-updater.enable=false` label (see below);
-- the updater itself, identified by its hostname or by the `docker-image-updater.self=true` label. It never updates itself: it only sends a notification.
+- containers opted out with the `docker-image-updater.enable=false` label (see below).
+
+The updater itself (identified by its hostname or by the `docker-image-updater.self=true` label) is watched and notified about, but it is never recreated: update it manually. Containers started with `--rm` (AutoRemove) are handled the same way, see below.
 
 To update a container, the updater inspects it and recreates it from that description:
 
@@ -88,16 +89,23 @@ To update a container, the updater inspects it and recreates it from that descri
 5. start the new container;
 6. remove the old container.
 
-If any step before the removal fails, the new container (if any) is removed, the old one is renamed back and started again, and the failure is reported as a rollback.
+If a step fails after the old container has been renamed and stopped (steps 2 to 5), the new container (if any) is removed, the old one is renamed back and started again, and the failure is reported as a rollback. A failure before that point (for example when the container cannot be inspected or renamed) leaves the old container untouched and is reported as failed. If the rollback itself fails, the error says that the service may be down and names the stopped old container (`<name>_old`, or `<name>` if only the restart failed) so you can start it by hand.
 
 Because the new container is rebuilt from `docker inspect`, this works the same for `docker run`, `docker compose` and `docker compose -p` containers:
 
 - all labels are preserved, including the `com.docker.compose.*` ones, and the `com.docker.compose.image` label is refreshed to the new image ID so that a later `docker compose up` does not recreate the container again;
 - anonymous volumes are re-bound to the new container, so their data is kept;
 - networks, aliases and static IP settings are carried over;
-- with `network_mode: container:X`, the hostname is not set on the new container, as Docker forbids it.
+- with `network_mode: container:X`, the hostname is not set on the new container, as Docker forbids it;
+- the image configuration is not inherited from the old image: `docker inspect` merges the image defaults with the container settings, so the updater drops the values that merely repeat the old image's defaults (environment variables, labels, command, entrypoint, working directory, user, stop signal, healthcheck, exposed ports and volumes). The defaults of the new image take effect, while everything you set yourself (your own variables, labels, command and so on) is kept. If the old image is already gone, the inspected configuration is used as is.
 
-In dry-run mode, and for the updater itself, an "update available" notification is sent once per new image.
+Other behaviours:
+
+- In dry-run mode, for the updater itself and for containers started with `--rm`, an "update available" notification is sent once per container and new image, until the updater restarts.
+- Containers started with `--rm` (AutoRemove) are never touched: stopping them would make Docker delete them, so no rollback would be possible. The updater only notifies you, and you must update them manually.
+- If pulling an image fails (for example a private image or a registry outage), the failure is logged, counted and notified once per image and error, not on every scan.
+- When the updated container is the network provider of other containers (`network_mode: container:X`), the success notification names those containers: they share its network stack and must be restarted or recreated manually.
+- Docker calls have timeouts (1 minute, and 30 minutes for pulls), so a stuck daemon cannot block the scan loop forever.
 
 ## Opting out
 
@@ -129,7 +137,7 @@ Image: nginx:latest
 1a2b3c4d5e6f → 7a8b9c0d1e2f
 ```
 
-Other messages are "Update available" (dry-run and the updater itself), "Update failed" and "Update failed and was rolled back".
+Other messages are "Update available" (dry-run, the updater itself and `--rm` containers), "Update failed", "Update failed and was rolled back" and "Cannot check image" (pull failure).
 
 ## Web dashboard
 
@@ -152,7 +160,10 @@ Set `WEB_ENABLED=true` to start a small web server (address set by `WEB_ADDR`, `
 ## Limitations
 
 - Private registries that need credentials are not supported: images are pulled without registry authentication.
-- A container using `network_mode: container:X` is not re-linked when `X` is recreated.
+- A container using `network_mode: container:X` is not re-linked when `X` is recreated: it is named in the notification and must be restarted manually.
+- Containers started with `--rm` are not updated automatically (see above).
+- Locally built images (compose `build:`, `docker build -t name`) should be opted out with the label: the updater pulls the same name from the registry, which would replace them with a different image or fail.
+- Containers attached to several networks need Docker Engine API 1.44 or later (Docker 25+).
 - Ordering between containers (`depends_on`) is not handled.
 - The updater never updates itself, it only notifies.
 - If an update is interrupted, a leftover `<name>_old` container must be removed manually.
