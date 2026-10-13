@@ -290,3 +290,20 @@ func TestRemoveImageConflictIsAnAPIError(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+func TestImageRepoTags(t *testing.T) {
+	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/images/sha256:111/json" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL)
+		}
+		w.Write([]byte(`{"Id":"sha256:111","RepoTags":["web:latest","web:1"]}`))
+	})
+	tags, err := c.ImageRepoTags(context.Background(), "sha256:111")
+	if err != nil || len(tags) != 2 || tags[0] != "web:latest" {
+		t.Fatalf("%v %v", tags, err)
+	}
+	c = newTest(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"Id":"sha256:111","RepoTags":null}`)) })
+	if tags, err := c.ImageRepoTags(context.Background(), "sha256:111"); err != nil || len(tags) != 0 {
+		t.Fatalf("%v %v", tags, err)
+	}
+}

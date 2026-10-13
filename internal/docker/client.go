@@ -177,6 +177,17 @@ func (c *Client) ImageIsLocal(ctx context.Context, id string) (bool, error) {
 	return len(out.RepoDigests) == 0, nil
 }
 
+// ImageRepoTags returns the repository tags an image still carries (empty for a dangling image).
+func (c *Client) ImageRepoTags(ctx context.Context, id string) ([]string, error) {
+	var out struct {
+		RepoTags []string
+	}
+	if err := c.do(ctx, "GET", "/images/"+id+"/json", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.RepoTags, nil
+}
+
 // CreateContainer creates a container from a full create payload and returns its ID.
 func (c *Client) CreateContainer(ctx context.Context, name string, body map[string]any) (string, error) {
 	var out struct {
