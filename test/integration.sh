@@ -218,6 +218,29 @@ assert_eq "docker compose up does not recreate the container again" "$COMPOSE_NE
 assert_contains "stats API counts the scan" '"scans":1,' "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
 assert_eq "healthz" "ok" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/healthz")"
 
+echo "==> forcing a scan from the web API"
+SCAN_URL="http://127.0.0.1:${WEB_PORT}/api/scan"
+scan_post() { curl -s -m 3 -o /dev/null -w '%{http_code}' -X POST "$@" "$SCAN_URL" || true; }
+assert_eq "scan without the X-Requested-With header is rejected" "403" "$(scan_post)"
+assert_eq "scan with a foreign Origin is rejected" "403" "$(scan_post -H 'X-Requested-With: docker-image-updater' -H 'Origin: http://evil.example')"
+assert_eq "GET on the scan endpoint is not allowed" "405" "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "$SCAN_URL" || true)"
+assert_contains "rejected scan requests did not start a scan" '"scans":1,' "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+# The last scan may have started less than 30 s ago: retry while the server answers 429.
+SCAN_CODE=""
+for _ in $(seq 1 40); do
+  SCAN_CODE="$(scan_post -H 'X-Requested-With: docker-image-updater')"
+  [ "$SCAN_CODE" == 429 ] || break
+  sleep 1
+done
+assert_eq "scan with the header is accepted" "202" "$SCAN_CODE"
+assert_match "an immediate second scan request is refused" '^(409|429)$' "$(scan_post -H 'X-Requested-With: docker-image-updater')"
+scan2=0
+for _ in $(seq 1 60); do
+  if [[ "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" || true)" == *'"scans":2,'* ]]; then scan2=1; break; fi
+  sleep 1
+done
+assert_eq "the forced scan ran (scans count reached 2)" "1" "$scan2"
+
 assert_contains "registry credentials enabled at startup" "registry credentials enabled" "$(docker logs diu-updater 2>&1)"
 assert_eq "updater logs never contain the registry password" "0" "$(docker logs diu-updater 2>&1 | grep -c -F "$REG_PASS" || true)"
 REG_AUTH_B64="$(printf '%s:%s' "$REG_USER" "$REG_PASS" | base64 | tr -d '\n')"

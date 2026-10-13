@@ -15,7 +15,7 @@ Keeps your running Docker containers up to date: it pulls fresh images on a sche
 - Periodic check, with the interval set in minutes.
 - Private registry support (GHCR, Docker Hub, self-hosted) through a mounted Docker config file.
 - Telegram notifications (optional).
-- Optional statistics dashboard.
+- Optional statistics dashboard, with a button to force a scan.
 - Per-container opt-out label.
 - Dry-run mode: only notify, never recreate.
 - Automatic rollback when an update fails.
@@ -201,8 +201,24 @@ Set `WEB_ENABLED=true` to start a small web server (address set by `WEB_ADDR`, `
 | `/`           | Statistics page. |
 | `/api/stats`  | The same statistics as JSON. |
 | `/healthz`    | Returns `ok`. |
+| `POST /api/scan` | Starts an immediate scan (see below). |
 
-**The dashboard has no authentication.** Bind it to `127.0.0.1` (for example `127.0.0.1:8080:8080` in the port mapping) or put it behind a reverse proxy that handles access control.
+### Forcing a scan
+
+The **Scan now** button in the page header starts a scan right away. While a scan runs the button is disabled and the page refreshes every second. The same action is available through the API, which needs a custom header:
+
+```bash
+curl -X POST -H 'X-Requested-With: docker-image-updater' http://127.0.0.1:8080/api/scan
+```
+
+The call returns immediately with `202` and `{"status":"started"}`. A forced scan restarts the schedule: the next automatic scan happens one interval after it ends. The endpoint is guarded:
+
+- the `X-Requested-With: docker-image-updater` header is required, and an `Origin` header, when present, must match the `Host` of the request, otherwise the answer is `403`;
+- only one scan runs at a time: `409` while one is running;
+- a forced scan is refused with `429` and a `Retry-After` header when the last scan started less than 30 seconds ago (automatic scans are not affected);
+- other methods answer `405`, and the request body is ignored.
+
+**The dashboard has no authentication.** Bind it to `127.0.0.1` (for example `127.0.0.1:8080:8080` in the port mapping) or put it behind a reverse proxy that handles access control. The dashboard is no longer strictly read-only: anyone who can reach it can force a scan. This does nothing the schedule would not do anyway, but there is still no authentication, so keep it on a private network or behind a reverse proxy.
 
 ## Security considerations
 
