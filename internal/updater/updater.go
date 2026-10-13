@@ -156,7 +156,6 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list containers: %w", err)
 	}
-	defer u.publishReport() // also when the scan is interrupted: publish what is known
 	groups := map[string][]docker.Container{}
 	var refs []string
 	watched, skipped := 0, 0
@@ -200,6 +199,9 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 		watched -= n
 		skipped += n
 	}
+	// Published before the scan is recorded, so that whoever sees the scan counted also sees its list;
+	// also when the scan was interrupted: publish what is known.
+	u.publishReport()
 	u.stats.RecordScan(start, time.Since(start), watched, skipped)
 	return ctx.Err()
 }
