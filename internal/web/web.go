@@ -63,9 +63,26 @@ func sameOrigin(r *http.Request) bool {
 	return err == nil && u.Host != "" && u.Host == r.Host
 }
 
-// Handler returns the HTTP handler serving the page (/), the JSON statistics (/api/stats), /healthz
-// and POST /api/scan, which asks for an immediate scan through trigger (answers 501 when trigger is nil).
-func Handler(snap func() stats.Snapshot, trigger func() ScanResult) http.Handler {
+// Option customises Handler.
+type Option func(*options)
+
+type options struct {
+	now func() time.Time
+}
+
+// WithClock sets the clock used for time-dependent output (default time.Now).
+func WithClock(now func() time.Time) Option {
+	return func(o *options) { o.now = now }
+}
+
+// Handler returns the HTTP handler serving the page (/), the JSON statistics (/api/stats), the
+// Prometheus metrics (/metrics), /healthz and POST /api/scan, which asks for an immediate scan
+// through trigger (answers 501 when trigger is nil).
+func Handler(snap func() stats.Snapshot, trigger func() ScanResult, opts ...Option) http.Handler {
+	o := options{now: time.Now}
+	for _, opt := range opts {
+		opt(&o)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -78,6 +95,11 @@ func Handler(snap func() stats.Snapshot, trigger func() ScanResult) http.Handler
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(snap())
+	})
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", metricsContentType)
+		w.Header().Set("Cache-Control", "no-store")
+		writeMetrics(w, snap(), o.now())
 	})
 	mux.HandleFunc("POST /api/scan", func(w http.ResponseWriter, r *http.Request) {
 		// The request body is never read.
