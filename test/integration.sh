@@ -232,6 +232,21 @@ CLEAN_OLD="$(docker inspect -f '{{.Image}}' diu-clean)"
 PLAIN_CID="$(docker inspect -f '{{.Id}}' diu-plain)"
 PLAIN_OLD="$(docker inspect -f '{{.Image}}' diu-plain)"
 
+echo "==> an untagged image reference must pull only :latest, never every tag of the repository"
+# The repository holds many tags. The container is started from the reference WITHOUT a tag, so its
+# Config.Image stays untagged; a raw Engine API pull of such a reference would fetch all the tags.
+UNTAGGED_REF="localhost:${REG_PORT}/diu-untagged"
+for t in extra1 extra2; do
+  publish_image "$UNTAGGED_REF:$t" 1 "$HC_OK"
+  docker rmi "$UNTAGGED_REF:$t" >/dev/null
+done
+publish_image "$UNTAGGED_REF:latest" 1 "$HC_OK"
+docker run -d --name diu-untagged "$UNTAGGED_REF" >/dev/null
+UNTAGGED_CID="$(docker inspect -f '{{.Id}}' diu-untagged)"
+UNTAGGED_OLD="$(docker inspect -f '{{.Image}}' diu-untagged)"
+assert_eq "diu-untagged keeps a reference without a tag" "$UNTAGGED_REF" "$(docker inspect -f '{{.Config.Image}}' diu-untagged)"
+assert_eq "only the latest tag of diu-untagged is local before the scan" "latest" "$(docker images --format '{{.Tag}}' "$UNTAGGED_REF" | sort | tr '\n' ' ' | sed 's/ $//')"
+
 echo "==> publishing image v2"
 docker tag "$REF" diu-keep:v1
 build_push 2
@@ -248,6 +263,8 @@ publish_v2_over_v1 "$CLEAN_REF" "$HC_OK"
 # v2 without any healthcheck and with a clean long-running command: the "no healthcheck, stable
 # for 10 seconds" path of the gate.
 publish_v2_over_v1 "$PLAIN_REF"
+publish_v2_over_v1 "$UNTAGGED_REF:latest" "$HC_OK"
+assert_eq "the untagged image tag points at v1 again" "$UNTAGGED_OLD" "$(docker image inspect -f '{{.Id}}' "$UNTAGGED_REF:latest")"
 assert_eq "the crash image tag points at v1 again" "$CRASH_OLD" "$(docker image inspect -f '{{.Id}}' "$CRASH_REF")"
 assert_eq "the unhealthy image tag points at v1 again" "$UNHEALTHY_OLD" "$(docker image inspect -f '{{.Id}}' "$UNHEALTHY_REF")"
 assert_eq "the clean image tag points at v1 again" "$CLEAN_OLD" "$(docker image inspect -f '{{.Id}}' "$CLEAN_REF")"
@@ -292,8 +309,8 @@ done
 if [ "$ok" != 1 ]; then echo "timeout waiting for the first scan"; docker logs diu-updater; exit 1; fi
 
 echo "==> assertions"
-# 5 containers of the standard image, diu-clean and diu-plain are updated; diu-crash and diu-unhealthy are rolled back.
-assert_eq "updates count (5 standard containers + diu-clean + diu-plain)" "7" "$(stat updates)"
+# 5 containers of the standard image, diu-clean, diu-plain and diu-untagged are updated; diu-crash and diu-unhealthy are rolled back.
+assert_eq "updates count (5 standard containers + diu-clean + diu-plain + diu-untagged)" "8" "$(stat updates)"
 assert_eq "rollbacks count (diu-crash, diu-unhealthy)" "2" "$(stat rollbacks)"
 assert_eq "failures count" "0" "$(stat failures)"
 STATS1="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
@@ -323,6 +340,16 @@ assert_eq "diu-plain is running" "true" "$(docker inspect -f '{{.State.Running}}
 assert_eq "diu-plain has no healthcheck" "no" "$(docker inspect -f '{{if .State.Health}}yes{{else}}no{{end}}' diu-plain)"
 assert_eq "diu-plain new version is running" "2" "$(docker exec diu-plain cat /version)"
 assert_match "diu-plain event is updated" '"container":"diu-plain","image":"[^"]*","old_id":"[^"]*","new_id":"[^"]*","status":"updated"' "$STATS1"
+
+echo "==> untagged reference: only :latest is pulled"
+UNTAGGED_NEW="$(docker image inspect -f '{{.Id}}' "$UNTAGGED_REF:latest")"
+assert_eq "diu-untagged uses the new image" "$UNTAGGED_NEW" "$(docker inspect -f '{{.Image}}' diu-untagged)"
+assert_eq "diu-untagged was recreated" "1" "$([ "$UNTAGGED_CID" != "$(docker inspect -f '{{.Id}}' diu-untagged)" ] && echo 1 || echo 0)"
+assert_eq "diu-untagged new version is running" "2" "$(docker exec diu-untagged cat /version)"
+assert_eq "diu-untagged still has a reference without a tag" "$UNTAGGED_REF" "$(docker inspect -f '{{.Config.Image}}' diu-untagged)"
+assert_eq "the extra tags of the repository were NOT pulled" "latest" "$(docker images --format '{{.Tag}}' "$UNTAGGED_REF" | sort | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "diu-untagged has a single updated event and no failure" "1" "$(grep -o '"container":"diu-untagged","image":"[^"]*","old_id":"[^"]*","new_id":"[^"]*","status":"updated"' <<< "$STATS1" | wc -l | tr -d ' ')"
+assert_eq "no pull failure is logged for diu-untagged" "0" "$(docker logs diu-updater 2>&1 | grep -c 'diu-untagged.*\(failed\|error\)' || true)"
 
 echo "==> cleanup of the old image"
 CLEAN_NEW="$(docker image inspect -f '{{.Id}}' "$CLEAN_REF")"
@@ -389,7 +416,7 @@ echo "==> container list of the stats API"
 STATS3="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
 assert_contains "the stats API carries the container list" '"containers":[{' "$STATS3"
 for name in diu-run "$(docker inspect -f '{{.Name}}' "$COMPOSE_NEW" | tr -d /)" "$(docker inspect -f '{{.Name}}' "$CUSTOM_NEW" | tr -d /)" \
-  diu-anonv diu-anonm diu-clean diu-plain; do
+  diu-anonv diu-anonm diu-clean diu-plain diu-untagged; do
   assert_eq "$name is listed as updated" "updated" "$(cstatus "$name" "$STATS3")"
 done
 assert_eq "diu-local is skipped" "skipped" "$(cstatus diu-local "$STATS3")"
@@ -408,7 +435,7 @@ echo "==> Prometheus metrics"
 METRICS_HEADERS="$(curl -s -m 3 -D - -o /dev/null "http://127.0.0.1:${WEB_PORT}/metrics" | tr -d '\r')"
 METRICS="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/metrics")"
 assert_contains "metrics content type" 'text/plain; version=0.0.4; charset=utf-8' "$METRICS_HEADERS"
-assert_contains "diu_updates_total" $'\ndiu_updates_total 7\n' $'\n'"$METRICS"
+assert_contains "diu_updates_total" $'\ndiu_updates_total 8\n' $'\n'"$METRICS"
 assert_contains "diu_rollbacks_total" $'\ndiu_rollbacks_total 2\n' $'\n'"$METRICS"
 assert_contains "diu_failures_total" $'\ndiu_failures_total 0\n' $'\n'"$METRICS"
 assert_contains "diu_scans_total" $'\ndiu_scans_total 1\n' $'\n'"$METRICS"
@@ -452,7 +479,7 @@ for pair in "diu-local:$LOCAL_CID:$LOCAL_IMG" "diu-notify:$NOTIFY_CID:$OLD" "diu
 done
 # A defective image is not retried: the forced scan neither recreates nor rolls back again.
 assert_eq "rollbacks stay at 2 after the forced scan" "2" "$(stat rollbacks)"
-assert_eq "updates stay at 7 after the forced scan" "7" "$(stat updates)"
+assert_eq "updates stay at 8 after the forced scan" "8" "$(stat updates)"
 assert_eq "diu-crash keeps its container id after the forced scan" "$CRASH_CID" "$(docker inspect -f '{{.Id}}' diu-crash)"
 assert_eq "diu-crash still runs v1 after the forced scan" "$CRASH_OLD" "$(docker inspect -f '{{.Image}}' diu-crash)"
 assert_eq "diu-unhealthy keeps its container id after the forced scan" "$UNHEALTHY_CID" "$(docker inspect -f '{{.Id}}' diu-unhealthy)"
