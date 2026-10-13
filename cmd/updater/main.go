@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 	_ "time/tzdata" // embedded zone database: the scratch image has none, TZ must still work
@@ -93,6 +94,7 @@ func main() {
 // tzUnrecognised reports whether the TZ variable is set to a zone the runtime could not load and
 // silently replaced by UTC.
 func tzUnrecognised(tz, local string) bool {
+	tz = strings.TrimPrefix(tz, ":") // POSIX allows a leading colon, as in TZ=":UTC"
 	return tz != "" && tz != "UTC" && tz != "Etc/UTC" && local == "UTC"
 }
 

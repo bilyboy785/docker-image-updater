@@ -19,7 +19,9 @@ Keeps your running Docker containers up to date: it pulls fresh images on a sche
 - Per-container opt-out label, update policy (`auto` or `notify`) and update time windows.
 - Locally built images are ignored silently.
 - Dry-run mode: only notify, never recreate.
+- Post-start health gate: the update is only kept once the new container proves it works, otherwise it is rolled back.
 - Automatic rollback when an update fails.
+- Optional cleanup of the previous image after an update.
 - Tiny `scratch` image (about 3 MB), multi-arch (`linux/amd64`, `linux/arm64`).
 - No third-party Go dependencies.
 
@@ -75,6 +77,8 @@ Every setting can be given as an environment variable or as a command-line flag.
 | `WEB_ADDR`               | `-web-addr`        | `:8080`                 | Listen address of the web server. |
 | `STATE_FILE`             | `-state-file`      | empty                   | File used to persist statistics across restarts. Statistics are not persisted when empty. |
 | `DOCKER_SOCKET`          | `-socket`          | `/var/run/docker.sock`  | Path of the Docker socket. |
+| `HEALTH_WAIT_SECONDS`    | `-health-wait`     | `60`                    | How long a new container is watched before the update is accepted, in seconds (integer from 0 to 600). `0` disables the health gate. See [Health gate](#health-gate). |
+| `CLEANUP_IMAGES`         | `-cleanup-images`  | `false`                 | Remove the previous image after a successful update. See [Cleaning up old images](#cleaning-up-old-images). |
 | `TZ`                     | none               | `UTC`                   | Time zone used to evaluate update windows, for example `Europe/Paris`. The zone database is embedded in the binary. See [Update policy and windows](#update-policy-and-windows). |
 | `DOCKER_CONFIG`          | `-docker-config`   | empty                   | Directory containing a Docker `config.json` with registry credentials. Pulls are anonymous when empty. See [Private registries](#private-registries). |
 
@@ -97,9 +101,10 @@ To update a container, the updater inspects it and recreates it from that descri
 3. create a new container with the original name and configuration, running the new image;
 4. connect the additional networks;
 5. start the new container;
-6. remove the old container.
+6. watch the new container (see [Health gate](#health-gate));
+7. remove the old container, only once the new one passed that check.
 
-If a step fails after the old container has been renamed and stopped (steps 2 to 5), the new container (if any) is removed, the old one is renamed back and started again, and the failure is reported as a rollback. A failure before that point (for example when the container cannot be inspected or renamed) leaves the old container untouched and is reported as failed. If the rollback itself fails, the error says that the service may be down and names the stopped old container (`<name>_old`, or `<name>` if only the restart failed) so you can start it by hand.
+If a step fails after the old container has been renamed and stopped (steps 2 to 6), the new container (if any) is removed, the old one is renamed back and started again, and the failure is reported as a rollback. A failure before that point (for example when the container cannot be inspected or renamed) leaves the old container untouched and is reported as failed. If the rollback itself fails, the error says that the service may be down and names the stopped old container (`<name>_old`, or `<name>` if only the restart failed) so you can start it by hand.
 
 Because the new container is rebuilt from `docker inspect`, this works the same for `docker run`, `docker compose` and `docker compose -p` containers:
 
@@ -113,10 +118,35 @@ Other behaviours:
 
 - In dry-run mode, for the updater itself and for containers started with `--rm`, an "update available" notification is sent once per container and new image, until the updater restarts.
 - Containers started with `--rm` (AutoRemove) are never touched: stopping them would make Docker delete them, so no rollback would be possible. The updater only notifies you, and you must update them manually.
-- The configuration of the image a container currently runs is read before the new image is pulled, because some image stores delete an image whose tag a pull replaces.
+- The configuration of the image a container currently runs is read before the new image is pulled, because some image stores may remove or untag the previous image once the tag moves.
 - If pulling an image fails (for example a private image or a registry outage), the failure is logged, counted and notified once per image and error, not on every scan.
 - When the updated container is the network provider of other containers (`network_mode: container:X`), the success notification names those containers: they share its network stack and must be restarted or recreated manually.
 - Docker calls have timeouts (1 minute, and 30 minutes for pulls), so a stuck daemon cannot block the scan loop forever.
+
+### Health gate
+
+Starting is not enough: an application can crash a few seconds after it starts, and by then the old container would already be gone. After the new container has started, the updater keeps the old (stopped) container and watches the new one for up to `HEALTH_WAIT_SECONDS` (60 seconds by default, from 0 to 600). The old container is removed only when the new one passes. If it fails, the update is rolled back as described above (the new container is removed, the old one is renamed back and restarted), the event is recorded with the `rolled_back` status, and the notification reads "rolled back to the previous image" followed by the reason.
+
+What counts as healthy depends on the image:
+
+- **The container has a healthcheck** (`HEALTHCHECK` in the image or `healthcheck:` in compose): the updater follows the healthcheck. `healthy` passes at once. `unhealthy` fails. `starting` keeps waiting. A container that exits or restarts while its healthcheck is still starting fails.
+- **No healthcheck**: the container must be running, not restarting, and its restart count must not increase for 10 seconds in a row (or for `HEALTH_WAIT_SECONDS` if that is shorter). A container that has stopped passes when its exit code is `0` (a one-shot job that finished gracefully) and fails with any other exit code. A restarting container, or a restart count that goes up (for example under `restart: always`), fails.
+- If the container vanishes (the daemon answers 404) the check fails. Other errors while inspecting it are tolerated for up to 3 consecutive attempts, then the check fails.
+
+Slow starters: when the healthcheck is still `starting` after `HEALTH_WAIT_SECONDS`, the update is kept, because an application with a long `start_period` must not be rolled back wrongly. The success notification then says "healthcheck still starting after Ns, update kept; raise HEALTH_WAIT_SECONDS for slow starters". Raise the value if you want the updater to wait for such an application.
+
+Set `HEALTH_WAIT_SECONDS=0` to disable the gate: the update then succeeds as soon as the new container has started. The gate adds at most `HEALTH_WAIT_SECONDS` to the update of each container, and an update in progress still completes (or rolls back) if the updater is asked to stop.
+
+### Cleaning up old images
+
+Pulled images pile up: every update leaves the previous image behind. With `CLEANUP_IMAGES=true`, after an update has passed the health gate and the old container has been removed, the updater asks the daemon to remove the image that old container ran, without `force`:
+
+- the removal is best effort and never makes an update fail: the daemon refuses when another container still uses the image (for example several containers on the same image that are not updated yet, or an opted-out one), and the image is then simply kept for now;
+- the image is not removed when it is the same as the new one;
+- nothing is removed after a rollback, since the previous image is the one running again;
+- if the old container could not be removed, its image is kept too.
+
+It is off by default.
 
 ### Locally built images
 
@@ -260,7 +290,7 @@ Notifications are queued and sent in the background, so a slow or failing Telegr
 - On shutdown, pending messages are flushed on a best-effort basis for up to 10 seconds.
 - Delivery is at-least-once: after an ambiguous network failure a notification may be delivered twice.
 
-Other messages are "Update available" (dry-run, `notify` policy, the updater itself and `--rm` containers), "Update failed", "Update failed and was rolled back" and "Cannot check image" (pull failure).
+Other messages are "Update available" (dry-run, `notify` policy, the updater itself and `--rm` containers), "Update failed", "Update failed and was rolled back" or "Update rolled back" (the new container failed the health gate) and "Cannot check image" (pull failure).
 
 ## Web dashboard
 
