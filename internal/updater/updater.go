@@ -72,6 +72,8 @@ type Updater struct {
 	healthWait time.Duration // post-start health gate duration; 0 disables it
 	hnow       func() time.Time
 	hsleep     func(ctx context.Context, d time.Duration)
+
+	report map[string]stats.ContainerStatus // per-scan container list, by container name
 }
 
 // New returns an Updater. selfID is the updater's own container id or hostname, used to
@@ -108,20 +110,59 @@ func (u *Updater) isSelf(c docker.Container) bool {
 	return c.Labels[SelfLabel] == "true" || (len(u.selfID) >= 12 && strings.HasPrefix(c.ID, u.selfID))
 }
 
+// maxDetail is the longest detail text kept in the container list.
+const maxDetail = 200
+
+// trunc cuts s to n characters.
+func trunc(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	return s
+}
+
+// note records what the current scan found about container c (running image ref).
+func (u *Updater) note(c docker.Container, ref, status, detail string) {
+	pol := "auto"
+	if p, err := ParsePolicy(c.Labels); err == nil && p.Notify {
+		pol = "notify"
+	}
+	if u.report == nil {
+		u.report = map[string]stats.ContainerStatus{}
+	}
+	u.report[c.Name()] = stats.ContainerStatus{
+		Name: c.Name(), Image: ref, ImageID: shortID(c.ImageID), Status: status,
+		Detail: trunc(strings.Join(strings.Fields(detail), " "), maxDetail),
+		Policy: pol, Window: c.Labels[WindowLabel], CheckedAt: u.now(),
+	}
+}
+
+// publishReport hands the container list of the scan to the stats store.
+func (u *Updater) publishReport() {
+	list := make([]stats.ContainerStatus, 0, len(u.report))
+	for _, e := range u.report {
+		list = append(list, e)
+	}
+	u.stats.SetContainers(list)
+}
+
 // RunOnce performs one full scan.
 func (u *Updater) RunOnce(ctx context.Context) error {
 	start := time.Now()
+	u.report = map[string]stats.ContainerStatus{}
 	lctx, lcancel := context.WithTimeout(ctx, u.apiTimeout)
 	containers, err := u.docker.ListContainers(lctx)
 	lcancel()
 	if err != nil {
 		return fmt.Errorf("list containers: %w", err)
 	}
+	defer u.publishReport() // also when the scan is interrupted: publish what is known
 	groups := map[string][]docker.Container{}
 	var refs []string
 	watched, skipped := 0, 0
 	for _, c := range containers {
 		if c.Labels[OptOutLabel] == "false" {
+			u.note(c, c.Image, stats.ContainerSkipped, "opted out (enable=false)")
 			skipped++
 			continue
 		}
@@ -130,12 +171,14 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 			// (after a failed update, a rollback or a dry-run): recover the real reference.
 			ref := u.configImage(ctx, c.ID)
 			if ref == "" {
+				u.note(c, c.Image, stats.ContainerSkipped, "image reference cannot be resolved")
 				skipped++
 				continue
 			}
 			c.Image = ref
 		}
 		if !isPullable(c.Image) {
+			u.note(c, c.Image, stats.ContainerSkipped, "pinned by digest")
 			skipped++
 			continue
 		}
@@ -195,6 +238,9 @@ func (u *Updater) configImage(ctx context.Context, id string) string {
 // It returns the number of containers it skipped because their image was built locally.
 func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.Container) int {
 	if u.isLocalImage(ctx, ref, cs) {
+		for _, c := range cs {
+			u.note(c, ref, stats.ContainerSkipped, "locally built image")
+		}
 		return len(cs)
 	}
 	// Read the config of the images currently run before the pull: with some image stores the pull
@@ -208,6 +254,7 @@ func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.C
 	err := u.docker.PullImage(pctx, ref, auth)
 	pcancel()
 	if err != nil {
+		u.noteAll(ctx, cs, ref, stats.ContainerFailed, "pull failed: "+err.Error())
 		u.reportImageFailure(ctx, "pull", ref, cs, err)
 		return 0
 	}
@@ -215,6 +262,7 @@ func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.C
 	newID, err := u.docker.ImageID(ictx, ref)
 	icancel()
 	if err != nil {
+		u.noteAll(ctx, cs, ref, stats.ContainerFailed, "image lookup failed: "+err.Error())
 		u.reportImageFailure(ctx, "image id", ref, cs, err)
 		return 0
 	}
@@ -222,11 +270,27 @@ func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.C
 		if ctx.Err() != nil {
 			return 0 // shutting down: do not turn that into a failed update
 		}
-		if c.ImageID != newID {
+		switch {
+		case c.ImageID != newID:
 			u.handle(ctx, c, ref, newID, all, cfgs)
+		case u.isSelf(c):
+			u.note(c, ref, stats.ContainerSelf, "never updates itself")
+		default:
+			u.note(c, ref, stats.ContainerUpToDate, "")
 		}
 	}
 	return 0
+}
+
+// noteAll records the same failure for every container of a group, unless the scan is being
+// interrupted (a cancelled call is not a real failure).
+func (u *Updater) noteAll(ctx context.Context, cs []docker.Container, ref, status, detail string) {
+	if ctx.Err() != nil {
+		return
+	}
+	for _, c := range cs {
+		u.note(c, ref, status, detail)
+	}
 }
 
 // oldConfigs reads, best effort, the config of every distinct image the containers of cs run.
@@ -331,25 +395,34 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 			note = "\nThe updater does not update itself: manual update required."
 		}
 		u.announceAvailable(ctx, ev, c, newID, note)
+		if self {
+			u.note(c, ref, stats.ContainerUpdateAvailable, "manual update required")
+		} else {
+			u.note(c, ref, stats.ContainerUpdateAvailable, "dry-run")
+		}
 		return
 	}
 	pol, perr := ParsePolicy(c.Labels)
 	if perr != nil {
 		// Fail closed: a typo must never turn into an update outside the intended window.
 		u.warnBadPolicy(c, perr)
+		u.note(c, ref, stats.ContainerSkipped, "invalid label: "+perr.Error())
 		return
 	}
 	if pol.Notify {
 		u.announceAvailable(ctx, ev, c, newID, "\n(policy: notify) The update is not applied automatically.")
+		u.note(c, ref, stats.ContainerUpdateAvailable, "policy: notify")
 		return
 	}
 	if !pol.InWindow(u.now().In(time.Local)) {
 		u.log.Debug("outside the update window, postponing", "container", ev.Container, "window", c.Labels[WindowLabel])
+		u.note(c, ref, stats.ContainerWaitingWindow, "outside the update window "+c.Labels[WindowLabel])
 		return
 	}
 	badKey := c.ID + "|" + newID
 	if u.badImage[badKey] {
 		u.log.Info("skipping image that previously failed the health gate", "container", ev.Container, "image_id", shortID(newID))
+		u.note(c, ref, stats.ContainerRolledBack, "previous update failed the health gate, will not retry this image")
 		return
 	}
 	ictx, icancel := context.WithTimeout(ctx, u.apiTimeout)
@@ -360,12 +433,14 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 	}
 	if err != nil {
 		u.finish(ctx, ev, ref, stats.StatusFailed, "", fmt.Errorf("inspect: %w", err), nil)
+		u.note(c, ref, stats.ContainerFailed, "inspect: "+err.Error())
 		return
 	}
 	if autoRemove, _ := info.HostConfig["AutoRemove"].(bool); autoRemove {
 		// Stopping such a container makes the daemon delete it, so it could not be rolled back.
 		u.announceAvailable(ctx, ev, c, newID,
 			"\nThe container uses AutoRemove (--rm) and cannot be updated safely: manual update required.")
+		u.note(c, ref, stats.ContainerUpdateAvailable, "AutoRemove (--rm): manual update required")
 		return
 	}
 	u.log.Info("updating container", "container", ev.Container, "image", ref)
@@ -379,6 +454,21 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 		dependants = dependantsOf(c, all)
 	}
 	u.finish(ctx, ev, ref, status, warn, err, dependants)
+	switch {
+	case status == stats.StatusUpdated:
+		c.ImageID = newID // the container now runs the new image
+		detail := ev.OldID + " -> " + ev.NewID
+		if warn != "" {
+			detail += ". " + warn
+		}
+		u.note(c, ref, stats.ContainerUpdated, detail)
+	case gerr != nil && status == stats.StatusRolledBack:
+		u.note(c, ref, stats.ContainerRolledBack, "health gate failed: "+gerr.reason)
+	case status == stats.StatusRolledBack:
+		u.note(c, ref, stats.ContainerRolledBack, err.Error())
+	default:
+		u.note(c, ref, stats.ContainerFailed, err.Error())
+	}
 }
 
 // dependantsOf returns the names of containers sharing the network stack of c
