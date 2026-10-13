@@ -71,7 +71,21 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 	var refs []string
 	watched, skipped := 0, 0
 	for _, c := range containers {
-		if c.Labels[OptOutLabel] == "false" || !isPullable(c.Image) {
+		if c.Labels[OptOutLabel] == "false" {
+			skipped++
+			continue
+		}
+		if bareID.MatchString(c.Image) {
+			// The daemon reports the bare image id when the tag now points to another image
+			// (after a failed update, a rollback or a dry-run): recover the real reference.
+			ref := u.configImage(ctx, c.ID)
+			if ref == "" {
+				skipped++
+				continue
+			}
+			c.Image = ref
+		}
+		if !isPullable(c.Image) {
 			skipped++
 			continue
 		}
@@ -90,6 +104,19 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 	}
 	u.stats.RecordScan(start, time.Since(start), watched, skipped)
 	return ctx.Err()
+}
+
+// configImage returns the image reference a container was created with, or "" if unknown or not pullable.
+func (u *Updater) configImage(ctx context.Context, id string) string {
+	info, err := u.docker.InspectContainer(ctx, id)
+	if err != nil || info == nil {
+		return ""
+	}
+	ref, _ := info.Config["Image"].(string)
+	if ref == "" || !isPullable(ref) {
+		return ""
+	}
+	return ref
 }
 
 func (u *Updater) checkImage(ctx context.Context, ref string, cs []docker.Container) {
@@ -137,7 +164,7 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 		return
 	}
 	u.log.Info("updating container", "container", ev.Container, "image", ref)
-	status, err := u.recreate(ctx, c, newID)
+	status, warn, err := u.recreate(ctx, c, newID)
 	ev.Status = status
 	if err != nil {
 		ev.Error = err.Error()
@@ -155,7 +182,13 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 	if err != nil {
 		msg += "\nError: " + html.EscapeString(err.Error())
 	}
-	u.notify(ctx, msg)
+	if warn != "" {
+		msg += "\n" + html.EscapeString(warn)
+	}
+	// The outcome must be reported even if shutdown started while we were working.
+	nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	u.notify(nctx, msg)
 }
 
 func (u *Updater) notify(ctx context.Context, text string) {
@@ -166,43 +199,54 @@ func (u *Updater) notify(ctx context.Context, text string) {
 
 // recreate replaces container c by a new one running the freshly pulled image.
 // The old container is renamed and stopped first so it can be restored if anything fails.
-func (u *Updater) recreate(ctx context.Context, c docker.Container, newImageID string) (string, error) {
+// Once the old container is touched the work must finish or be rolled back, so every step runs
+// on a context detached from the caller's cancellation (bounded by a timeout). The returned
+// warning is non-empty when the update succeeded but left something to clean up.
+func (u *Updater) recreate(ctx context.Context, c docker.Container, newImageID string) (status, warn string, err error) {
 	info, err := u.docker.InspectContainer(ctx, c.ID)
 	if err != nil {
-		return stats.StatusFailed, fmt.Errorf("inspect: %w", err)
+		return stats.StatusFailed, "", fmt.Errorf("inspect: %w", err)
 	}
 	spec := buildCreateSpec(info, newImageID)
 	name := c.Name()
 
-	if err := u.docker.RenameContainer(ctx, c.ID, name+"_old"); err != nil {
-		return stats.StatusFailed, fmt.Errorf("rename old container: %w", err)
+	opctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+	defer cancel()
+
+	if err := u.docker.RenameContainer(opctx, c.ID, name+"_old"); err != nil {
+		return stats.StatusFailed, "", fmt.Errorf("rename old container: %w", err)
 	}
-	if err := u.docker.StopContainer(ctx, c.ID); err != nil {
-		_ = u.docker.RenameContainer(ctx, c.ID, name)
-		return stats.StatusFailed, fmt.Errorf("stop old container: %w", err)
+	if err := u.docker.StopContainer(opctx, c.ID); err != nil {
+		// The daemon may already have stopped it: restore the name and make sure it runs.
+		st, e := u.rollback(opctx, c, name, "", fmt.Errorf("stop old container: %w", err))
+		return st, "", e
 	}
-	newID, err := u.docker.CreateContainer(ctx, name, spec.Body)
+	newID, err := u.docker.CreateContainer(opctx, name, spec.Body)
 	if err != nil {
-		return u.rollback(ctx, c, name, "", fmt.Errorf("create new container: %w", err))
+		st, e := u.rollback(opctx, c, name, "", fmt.Errorf("create new container: %w", err))
+		return st, "", e
 	}
 	for _, n := range spec.Extra {
-		if err := u.docker.ConnectNetwork(ctx, n.Network, newID, n.Endpoint); err != nil {
-			return u.rollback(ctx, c, name, newID, fmt.Errorf("connect network %s: %w", n.Network, err))
+		if err := u.docker.ConnectNetwork(opctx, n.Network, newID, n.Endpoint); err != nil {
+			st, e := u.rollback(opctx, c, name, newID, fmt.Errorf("connect network %s: %w", n.Network, err))
+			return st, "", e
 		}
 	}
-	if err := u.docker.StartContainer(ctx, newID); err != nil {
-		return u.rollback(ctx, c, name, newID, fmt.Errorf("start new container: %w", err))
+	if err := u.docker.StartContainer(opctx, newID); err != nil {
+		st, e := u.rollback(opctx, c, name, newID, fmt.Errorf("start new container: %w", err))
+		return st, "", e
 	}
-	if err := u.docker.RemoveContainer(ctx, c.ID, false); err != nil {
+	if err := u.docker.RemoveContainer(opctx, c.ID, false); err != nil {
 		u.log.Warn("could not remove old container", "container", name+"_old", "error", err)
+		warn = fmt.Sprintf("Warning: the old container %s_old could not be removed and must be removed manually.", name)
 	}
-	return stats.StatusUpdated, nil
+	return stats.StatusUpdated, warn, nil
 }
 
 // rollback restores the old container. It uses a context detached from cancellation so that a
 // shutdown in the middle of an update does not leave the service stopped.
 func (u *Updater) rollback(ctx context.Context, old docker.Container, name, newID string, cause error) (string, error) {
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second) // never cancelled by the caller
 	defer cancel()
 	if newID != "" {
 		if err := u.docker.RemoveContainer(rctx, newID, true); err != nil {

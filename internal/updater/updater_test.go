@@ -20,50 +20,87 @@ type fakeDocker struct {
 	pullErr    map[string]error
 	failOn     map[string]error // method name -> error
 	calls      []string
+	onPull     func() // optional hook, runs inside PullImage
+	onStop     func() // optional hook, runs inside StopContainer
 }
 
 func (f *fakeDocker) rec(s string)        { f.calls = append(f.calls, s) }
 func (f *fakeDocker) fail(m string) error { return f.failOn[m] }
 
-func (f *fakeDocker) ListContainers(context.Context) ([]docker.Container, error) {
+// Every method honours an already-cancelled context, like the real client does.
+
+func (f *fakeDocker) ListContainers(ctx context.Context) ([]docker.Container, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return f.containers, f.fail("List")
 }
-func (f *fakeDocker) InspectContainer(_ context.Context, id string) (*docker.ContainerInfo, error) {
+func (f *fakeDocker) InspectContainer(ctx context.Context, id string) (*docker.ContainerInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return f.info[id], f.fail("Inspect")
 }
-func (f *fakeDocker) PullImage(_ context.Context, ref string) error {
+func (f *fakeDocker) PullImage(ctx context.Context, ref string) error {
 	f.rec("pull " + ref)
+	if f.onPull != nil {
+		f.onPull()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return f.pullErr[ref]
 }
-func (f *fakeDocker) ImageID(_ context.Context, ref string) (string, error) {
-	return f.images[ref], nil
+func (f *fakeDocker) ImageID(ctx context.Context, ref string) (string, error) {
+	return f.images[ref], ctx.Err()
 }
-func (f *fakeDocker) CreateContainer(_ context.Context, name string, _ map[string]any) (string, error) {
+func (f *fakeDocker) CreateContainer(ctx context.Context, name string, _ map[string]any) (string, error) {
 	f.rec("create " + name)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	return "newid", f.fail("Create")
 }
-func (f *fakeDocker) StartContainer(_ context.Context, id string) error {
+func (f *fakeDocker) StartContainer(ctx context.Context, id string) error {
 	f.rec("start " + id)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if id == "newid" {
 		return f.fail("StartNew")
 	}
 	return nil
 }
-func (f *fakeDocker) StopContainer(_ context.Context, id string) error {
+func (f *fakeDocker) StopContainer(ctx context.Context, id string) error {
 	f.rec("stop " + id)
+	if f.onStop != nil {
+		f.onStop()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return f.fail("Stop")
 }
-func (f *fakeDocker) RemoveContainer(_ context.Context, id string, force bool) error {
+func (f *fakeDocker) RemoveContainer(ctx context.Context, id string, force bool) error {
 	f.rec("remove " + id)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if id == "a" {
+		return f.fail("RemoveOld")
+	}
 	return nil
 }
-func (f *fakeDocker) RenameContainer(_ context.Context, id, name string) error {
+func (f *fakeDocker) RenameContainer(ctx context.Context, id, name string) error {
 	f.rec(fmt.Sprintf("rename %s %s", id, name))
-	return nil
+	return ctx.Err()
 }
-func (f *fakeDocker) ConnectNetwork(_ context.Context, network, id string, _ map[string]any) error {
+func (f *fakeDocker) ConnectNetwork(ctx context.Context, network, id string, _ map[string]any) error {
 	f.rec("connect " + network)
-	return nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.fail("Connect")
 }
 
 type fakeNotifier struct{ msgs []string }
@@ -241,19 +278,19 @@ func TestCreateFailureRollsBackWithoutRemovingNew(t *testing.T) {
 	}
 }
 
-func TestStopFailureRestoresName(t *testing.T) {
+func TestStopFailureRestoresNameAndRestarts(t *testing.T) {
 	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
 		info:   map[string]*docker.ContainerInfo{"a": basicInfo("a")},
 		images: map[string]string{"nginx:latest": "sha256:2"},
 		failOn: map[string]error{"Stop": errors.New("timeout")}}
 	u, _, s := newUpdater(f, false)
 	u.RunOnce(context.Background())
-	want := "pull nginx:latest|rename a a_old|stop a|rename a a"
+	want := "pull nginx:latest|rename a a_old|stop a|rename a a|start a"
 	if got := strings.Join(f.calls, "|"); got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-	if s.Snapshot().Failures != 1 {
-		t.Fatalf("%+v", s.Snapshot())
+	if snap := s.Snapshot(); snap.Rollbacks != 1 || snap.Events[0].Status != stats.StatusRolledBack {
+		t.Fatalf("%+v", snap)
 	}
 }
 
@@ -298,5 +335,107 @@ func TestListFailureIsReturned(t *testing.T) {
 	u, _, _ := newUpdater(f, false)
 	if err := u.RunOnce(context.Background()); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+const fullSequence = "pull nginx:latest|rename a a_old|stop a|create a|start newid|remove a"
+
+// noCtxCheckPull lets inspect, pull and image-id lookup succeed even with a cancelled context, so
+// the scenario "ctx cancelled right as the cycle reaches recreate" can be exercised.
+type noCtxCheckPull struct{ *fakeDocker }
+
+func (c *noCtxCheckPull) PullImage(_ context.Context, ref string) error {
+	return c.fakeDocker.PullImage(context.Background(), ref)
+}
+func (c *noCtxCheckPull) ImageID(_ context.Context, ref string) (string, error) {
+	return c.fakeDocker.ImageID(context.Background(), ref)
+}
+func (c *noCtxCheckPull) InspectContainer(_ context.Context, id string) (*docker.ContainerInfo, error) {
+	return c.fakeDocker.InspectContainer(context.Background(), id)
+}
+
+func TestCancelledContextBeforeRecreateStillCompletesUpdate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:   map[string]*docker.ContainerInfo{"a": basicInfo("a")},
+		images: map[string]string{"nginx:latest": "sha256:2"}}
+	f.onPull = cancel // the cycle then proceeds into recreate with a dead caller context
+	u, n, s := newUpdater(f, false)
+	u.docker = &noCtxCheckPull{f}
+	u.RunOnce(ctx)
+	if got := strings.Join(f.calls, "|"); got != fullSequence {
+		t.Fatalf("got  %s\nwant %s", got, fullSequence)
+	}
+	if s.Snapshot().Updates != 1 || len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "Updated") {
+		t.Fatalf("%+v %v", s.Snapshot(), n.msgs)
+	}
+}
+
+func TestCancelDuringStopStillCompletesUpdate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:   map[string]*docker.ContainerInfo{"a": basicInfo("a")},
+		images: map[string]string{"nginx:latest": "sha256:2"}}
+	f.onStop = cancel
+	u, n, s := newUpdater(f, false)
+	u.RunOnce(ctx)
+	if got := strings.Join(f.calls, "|"); got != fullSequence {
+		t.Fatalf("got  %s\nwant %s", got, fullSequence)
+	}
+	if s.Snapshot().Updates != 1 || len(n.msgs) != 1 {
+		t.Fatalf("%+v %v", s.Snapshot(), n.msgs)
+	}
+}
+
+func TestOldContainerRemovalFailureIsReported(t *testing.T) {
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:   map[string]*docker.ContainerInfo{"a": basicInfo("a")},
+		images: map[string]string{"nginx:latest": "sha256:2"},
+		failOn: map[string]error{"RemoveOld": errors.New("busy")}}
+	u, n, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	if s.Snapshot().Events[0].Status != stats.StatusUpdated || len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "a_old") {
+		t.Fatalf("%+v %v", s.Snapshot(), n.msgs)
+	}
+}
+
+func TestBareImageIDIsResolvedFromContainerConfig(t *testing.T) {
+	f := &fakeDocker{containers: []docker.Container{web("a", "sha256:0123456789abcdef", "sha256:1", nil)},
+		info:   map[string]*docker.ContainerInfo{"a": basicInfo("a")},
+		images: map[string]string{"nginx:latest": "sha256:2"}}
+	u, _, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	if snap := s.Snapshot(); snap.Updates != 1 || snap.Watched != 1 || snap.Events[0].Image != "nginx:latest" {
+		t.Fatalf("%+v %v", s.Snapshot(), f.calls)
+	}
+}
+
+func TestBareImageIDWithBareConfigImageIsSkipped(t *testing.T) {
+	info := basicInfo("a")
+	info.Config["Image"] = "sha256:0123456789abcdef"
+	f := &fakeDocker{containers: []docker.Container{web("a", "0123456789ab", "sha256:1", nil)},
+		info: map[string]*docker.ContainerInfo{"a": info}}
+	u, _, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	if snap := s.Snapshot(); snap.Skipped != 1 || snap.Watched != 0 || len(f.calls) != 0 {
+		t.Fatalf("%+v %v", snap, f.calls)
+	}
+}
+
+func TestConnectNetworkFailureRollsBack(t *testing.T) {
+	info := basicInfo("a")
+	info.NetworkSettings.Networks = map[string]map[string]any{"bridge": {}, "backend": {}}
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:   map[string]*docker.ContainerInfo{"a": info},
+		images: map[string]string{"nginx:latest": "sha256:2"},
+		failOn: map[string]error{"Connect": errors.New("no such network")}}
+	u, _, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	got := strings.Join(f.calls, "|")
+	if !strings.Contains(got, "create a|connect ") || !strings.HasSuffix(got, "|remove newid|rename a a|start a") {
+		t.Fatalf("got %s", got)
+	}
+	if snap := s.Snapshot(); snap.Rollbacks != 1 || snap.Events[0].Status != stats.StatusRolledBack {
+		t.Fatalf("%+v", snap)
 	}
 }
