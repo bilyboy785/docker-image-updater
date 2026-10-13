@@ -397,6 +397,30 @@ Behind a reverse proxy, the proxy must forward the original `Host` header, becau
 - Because of this, the image runs as root.
 - Keep the web port private (see above).
 
+### Verifying images
+
+Release images are signed with [cosign](https://github.com/sigstore/cosign) (keyless, through GitHub's OIDC identity) and ship with a build provenance and an SBOM. Signing starts with v1.2.0: images up to and including v1.1.0 are not signed.
+
+Verify the signature of a tag (replace `v1.2.0` with the version you run):
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/bilyboy785/docker-image-updater/\.github/workflows/release\.yml@refs/tags/.*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/bilyboy785/docker-image-updater:v1.2.0
+```
+
+The signature is attached to the image digest, so it is valid for every tag that points to it. Pin the digest in your Compose file if you want the exact image you verified.
+
+The provenance and the SBOM are attached by BuildKit as attestations of the image index (they are not cosign attestations, so `cosign verify-attestation` and `cosign download sbom` do not apply). Inspect them with:
+
+```bash
+docker buildx imagetools inspect ghcr.io/bilyboy785/docker-image-updater:v1.2.0 --format '{{ json .SBOM }}'
+docker buildx imagetools inspect ghcr.io/bilyboy785/docker-image-updater:v1.2.0 --format '{{ json .Provenance }}'
+```
+
+The Dockerfile base image and every GitHub Action are pinned by digest or commit SHA, and Dependabot proposes weekly updates for them. CI also runs [govulncheck](https://go.dev/doc/security/vuln/) on every push to `main` and every pull request.
+
 ## Limitations
 
 - Registry credential helpers and credential stores are not supported: put an inline `auth` entry in the Docker config file (see "Private registries").
@@ -435,7 +459,7 @@ Layout:
 - `internal/web`: dashboard and API.
 - `test`: integration test.
 
-Every push to `main` and every pull request runs the unit and integration tests. To release, publish a GitHub release for a `v*` tag (for example `gh release create v1.0.0 --generate-notes`): the Release workflow re-runs the tests, then builds and pushes the multi-arch image to `ghcr.io`. Pre-releases (for example `v1.1.0-rc1`) do not update `latest`.
+Every push to `main` and every pull request runs the unit and integration tests. To release, publish a GitHub release for a `v*` tag (for example `gh release create v1.0.0 --generate-notes`): the Release workflow re-runs the tests, then builds and pushes the multi-arch image to `ghcr.io`, signs it and attaches its provenance and SBOM. Pre-releases (for example `v1.1.0-rc1`) do not update `latest`.
 
 ## License
 
