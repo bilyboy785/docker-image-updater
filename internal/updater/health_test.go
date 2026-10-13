@@ -153,7 +153,7 @@ func TestGateNoHealthcheckStabilityWindowIsCappedByTheWait(t *testing.T) {
 
 func TestGateRestartCountIncreaseFails(t *testing.T) {
 	u, f, _, s, _ := gateSetup(60*time.Second,
-		state(true, false, 0, "", 2), state(true, false, 0, "", 2), state(true, false, 0, "", 3))
+		state(true, false, 0, "", 0), state(true, false, 0, "", 0), state(true, false, 0, "", 1))
 	u.RunOnce(context.Background())
 	ev := s.Snapshot().Events[0]
 	if ev.Status != stats.StatusRolledBack || !strings.Contains(ev.Error, "restart") || indexOf(f.calls, "remove a") != -1 {
@@ -241,16 +241,39 @@ func TestGateDisabledSkipsInspection(t *testing.T) {
 	}
 }
 
-func TestGateCompletesWhenTheCallerIsCancelledMidGate(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	u, f, _, s, _ := gateSetup(60*time.Second, running("starting"), running("healthy"))
+// cancelOnInspectNew cancels the caller context from inside the inspection number n of the new container.
+func cancelOnInspectNew(f *fakeDocker, cancel func(), n int) {
 	inner := f.inspectNew
-	f.inspectNew = func(n int) (*docker.ContainerInfo, error) {
-		if n == 1 {
+	f.inspectNew = func(i int) (*docker.ContainerInfo, error) {
+		if i == n {
 			cancel()
 		}
-		return inner(n)
+		return inner(i)
 	}
+}
+
+func TestGateAbortsAndRollsBackWhenTheUpdaterIsStoppedMidGate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	u, f, n, s, _ := gateSetup(60*time.Second, running("starting"), running("healthy"))
+	cancelOnInspectNew(f, cancel, 1)
+	u.RunOnce(ctx)
+	want := beforeGate + "|inspect newid|remove newid|rename a a|start a"
+	if got := strings.Join(f.calls, "|"); got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	ev := s.Snapshot().Events[0]
+	if ev.Status != stats.StatusRolledBack || !strings.Contains(ev.Error, "updater stopping during health gate") {
+		t.Fatalf("%+v", ev)
+	}
+	if len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "Rolled back to the previous image: updater stopping during health gate") {
+		t.Fatalf("the outcome must be notified: %v", n.msgs)
+	}
+}
+
+func TestGateIsNotAbortedByACancelThatHappenedBeforeItStarted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	u, f, _, s, _ := gateSetup(60*time.Second, running("starting"), running("healthy"))
+	u.docker = &cancelOnStart{fakeDocker: f, cancel: cancel}
 	u.RunOnce(ctx)
 	if got := strings.Join(f.calls, "|"); got != beforeGate+"|inspect newid|inspect newid|remove a" {
 		t.Fatalf("got %s", got)
@@ -260,19 +283,123 @@ func TestGateCompletesWhenTheCallerIsCancelledMidGate(t *testing.T) {
 	}
 }
 
-func TestGateCancelledMidGateStillRollsBackOnFailure(t *testing.T) {
+func TestGateVerdictWinsOverACancelDuringTheLastInspection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	u, f, _, s, _ := gateSetup(60*time.Second, running("starting"), running("unhealthy"))
-	inner := f.inspectNew
-	f.inspectNew = func(n int) (*docker.ContainerInfo, error) {
-		if n == 1 {
-			cancel()
-		}
-		return inner(n)
-	}
+	u, f, _, s, _ := gateSetup(60*time.Second, running("starting"), running("healthy"))
+	cancelOnInspectNew(f, cancel, 2)
 	u.RunOnce(ctx)
-	if !strings.HasSuffix(strings.Join(f.calls, "|"), "remove newid|rename a a|start a") || s.Snapshot().Rollbacks != 1 {
+	if f.calls[len(f.calls)-1] != "remove a" || s.Snapshot().Updates != 1 {
 		t.Fatalf("%v %+v", f.calls, s.Snapshot())
+	}
+}
+
+func TestGateNonRunningStatesOtherThanExitedFail(t *testing.T) {
+	for _, status := range []string{"created", "dead", "removing", "paused"} {
+		p := state(false, false, 0, "", 0)
+		p.info.State.Status = status
+		u, _, _, s, _ := gateSetup(60*time.Second, p)
+		u.RunOnce(context.Background())
+		if ev := s.Snapshot().Events[0]; ev.Status != stats.StatusRolledBack || !strings.Contains(ev.Error, status) {
+			t.Errorf("%s: %+v", status, ev)
+		}
+	}
+}
+
+func TestGateTreatsEmptyOrNoneHealthAsNoHealthcheck(t *testing.T) {
+	for _, h := range []string{"", "none"} {
+		p := running("")
+		if h != "" {
+			p = running(h)
+		} else {
+			p.info.State.Health = &struct{ Status string }{""}
+		}
+		u, _, _, s, clk := gateSetup(60*time.Second, p)
+		start := clk.t
+		u.RunOnce(context.Background())
+		if got := clk.t.Sub(start); got != 10*time.Second || s.Snapshot().Updates != 1 {
+			t.Errorf("%q: waited %v, %+v", h, got, s.Snapshot())
+		}
+	}
+}
+
+func TestGateTransientErrorOnTheLastPollKeepsTheLastObservation(t *testing.T) {
+	boom := probe{err: errors.New("daemon busy")}
+	u, f, n, s, _ := gateSetup(3*time.Second, running("starting"), running("starting"), running("starting"), boom)
+	u.RunOnce(context.Background())
+	if f.calls[len(f.calls)-1] != "remove a" || s.Snapshot().Updates != 1 {
+		t.Fatalf("%v %+v", f.calls, s.Snapshot())
+	}
+	if len(n.msgs) != 1 || !strings.Contains(n.msgs[0], "still starting after 3s") {
+		t.Fatalf("%v", n.msgs)
+	}
+}
+
+func TestGateWithoutAnyValidObservationFailsAtTheDeadline(t *testing.T) {
+	boom := probe{err: errors.New("daemon busy")}
+	u, _, _, s, _ := gateSetup(2*time.Second, boom)
+	u.RunOnce(context.Background())
+	if ev := s.Snapshot().Events[0]; ev.Status != stats.StatusRolledBack || !strings.Contains(ev.Error, "daemon busy") {
+		t.Fatalf("%+v", ev)
+	}
+}
+
+func TestGateRestartBeforeTheFirstObservationCounts(t *testing.T) {
+	u, _, _, s, _ := gateSetup(60*time.Second, state(true, false, 0, "", 1))
+	u.RunOnce(context.Background())
+	if ev := s.Snapshot().Events[0]; ev.Status != stats.StatusRolledBack || !strings.Contains(ev.Error, "restart") {
+		t.Fatalf("%+v", ev)
+	}
+}
+
+func TestGateStabilityWindowStartsAtTheFirstSuccessfulObservation(t *testing.T) {
+	boom := probe{err: errors.New("daemon busy")}
+	u, _, _, s, clk := gateSetup(60*time.Second, boom, boom, running(""))
+	start := clk.t
+	u.RunOnce(context.Background())
+	if got := clk.t.Sub(start); got != 12*time.Second || s.Snapshot().Updates != 1 {
+		t.Fatalf("waited %v, %+v", got, s.Snapshot())
+	}
+}
+
+// A defective image must not be retried at every scan.
+
+func TestGateRollbackIsRememberedAndTheSameImageIsNotRetried(t *testing.T) {
+	u, f, n, s, _ := gateSetup(60*time.Second, running("unhealthy"))
+	u.RunOnce(context.Background())
+	f.calls = nil
+	u.RunOnce(context.Background())
+	for _, c := range f.calls {
+		if !strings.HasPrefix(c, "pull") {
+			t.Fatalf("no recreate cycle expected for a known bad image: %v", f.calls)
+		}
+	}
+	snap := s.Snapshot()
+	if snap.Rollbacks != 1 || len(snap.Events) != 1 || len(n.msgs) != 1 {
+		t.Fatalf("%+v %v", snap, n.msgs)
+	}
+}
+
+func TestGateANewImageIDIsRetried(t *testing.T) {
+	u, f, _, s, _ := gateSetup(60*time.Second, running("unhealthy"))
+	u.RunOnce(context.Background())
+	f.images["nginx:latest"] = "sha256:3"
+	f.calls = nil
+	u.RunOnce(context.Background())
+	if indexOf(f.calls, "create a") == -1 || s.Snapshot().Rollbacks != 2 {
+		t.Fatalf("%v %+v", f.calls, s.Snapshot())
+	}
+}
+
+func TestOtherRollbacksAreStillRetried(t *testing.T) {
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:   map[string]*docker.ContainerInfo{"a": basicInfo("a")},
+		images: map[string]string{"nginx:latest": "sha256:2"},
+		failOn: map[string]error{"StartNew": errors.New("port already allocated")}}
+	u, _, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	u.RunOnce(context.Background())
+	if s.Snapshot().Rollbacks != 2 {
+		t.Fatalf("%+v", s.Snapshot())
 	}
 }
 

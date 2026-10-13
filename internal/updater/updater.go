@@ -59,6 +59,7 @@ type Updater struct {
 	dryRun   bool
 	log      *slog.Logger
 	notified map[string]bool  // dedup keys of notifications already sent since start
+	badImage map[string]bool  // "container id|new image id" pairs that failed the health gate since start
 	auth     AuthProvider     // registry credentials; nil means anonymous pulls
 	now      func() time.Time // clock used to evaluate update windows
 
@@ -75,7 +76,7 @@ type Updater struct {
 // New returns an Updater. selfID is the updater's own container id or hostname, used to
 // recognise (and never recreate) its own container.
 func New(d DockerAPI, n notify.Notifier, s *stats.Stats, selfID string, dryRun bool, log *slog.Logger) *Updater {
-	return &Updater{docker: d, notifier: n, stats: s, selfID: selfID, dryRun: dryRun, log: log, notified: map[string]bool{}, now: time.Now,
+	return &Updater{docker: d, notifier: n, stats: s, selfID: selfID, dryRun: dryRun, log: log, notified: map[string]bool{}, badImage: map[string]bool{}, now: time.Now,
 		apiTimeout: defaultAPITimeout, pullTimeout: defaultPullTimeout,
 		hnow: time.Now, hsleep: sleepCtx}
 }
@@ -345,6 +346,11 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 		u.log.Debug("outside the update window, postponing", "container", ev.Container, "window", c.Labels[WindowLabel])
 		return
 	}
+	badKey := c.ID + "|" + newID
+	if u.badImage[badKey] {
+		u.log.Info("skipping image that previously failed the health gate", "container", ev.Container, "image_id", shortID(newID))
+		return
+	}
 	ictx, icancel := context.WithTimeout(ctx, u.apiTimeout)
 	info, err := u.docker.InspectContainer(ictx, c.ID)
 	icancel()
@@ -363,6 +369,10 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 	}
 	u.log.Info("updating container", "container", ev.Container, "image", ref)
 	status, warn, err := u.recreate(ctx, c, info, newID, cfgs)
+	var gerr *gateError
+	if status == stats.StatusRolledBack && errors.As(err, &gerr) {
+		u.badImage[badKey] = true
+	}
 	var dependants []string
 	if status == stats.StatusUpdated {
 		dependants = dependantsOf(c, all)
@@ -479,7 +489,7 @@ func (u *Updater) recreate(ctx context.Context, c docker.Container, info *docker
 		st, e := u.rollback(opctx, c, name, newID, fmt.Errorf("start new container: %w", err))
 		return st, "", e
 	}
-	note, gerr := u.waitHealthy(opctx, newID, u.healthWait)
+	note, gerr := u.waitHealthy(opctx, ctx, newID, u.healthWait)
 	if gerr != nil {
 		st, e := u.rollback(opctx, c, name, newID, gerr)
 		return st, "", e
