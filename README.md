@@ -2,9 +2,11 @@
 
 Keeps your running Docker containers up to date: it pulls fresh images on a schedule and recreates the containers that changed.
 
-[![CI](https://github.com/bilyboy785/docker-image-updater/actions/workflows/ci.yml/badge.svg)](https://github.com/bilyboy785/docker-image-updater/actions/workflows/ci.yml)
+[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/bilyboy785/docker-image-updater/ci.yml)](https://github.com/bilyboy785/docker-image-updater/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/bilyboy785/docker-image-updater)](https://github.com/bilyboy785/docker-image-updater/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Image](https://img.shields.io/badge/ghcr.io-docker--image--updater-informational)](https://github.com/bilyboy785/docker-image-updater/pkgs/container/docker-image-updater)
+[![Image size](https://ghcr-badge.egpl.dev/bilyboy785/docker-image-updater/size)](https://github.com/bilyboy785/docker-image-updater/pkgs/container/docker-image-updater)
 
 ## Features
 
