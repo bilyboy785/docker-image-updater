@@ -30,7 +30,7 @@ Keeps your running Docker containers up to date: it pulls fresh images on a sche
 With `docker run`:
 
 ```bash
-docker run -d --name docker-image-updater --restart unless-stopped \
+docker run -d --name docker-image-updater --restart unless-stopped --stop-timeout 60 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v updater-data:/data \
   -e CHECK_INTERVAL_MINUTES=60 \
@@ -45,7 +45,7 @@ services:
   docker-image-updater:
     image: ghcr.io/bilyboy785/docker-image-updater:latest
     restart: unless-stopped
-    stop_grace_period: 30s   # the scan in progress and the notification flush must fit (docker stop waits 10 s by default)
+    stop_grace_period: 60s   # the update in progress (a rollback takes up to about 60 s) and the notification flush must fit (docker stop waits 10 s by default)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - updater-data:/data
@@ -135,7 +135,16 @@ What counts as healthy depends on the image:
 
 Slow starters: when the healthcheck is still `starting` after `HEALTH_WAIT_SECONDS`, the update is kept, because an application with a long `start_period` must not be rolled back wrongly. The success notification then says "healthcheck still starting after Ns, update kept; raise HEALTH_WAIT_SECONDS for slow starters". Raise the value if you want the updater to wait for such an application.
 
-Set `HEALTH_WAIT_SECONDS=0` to disable the gate: the update then succeeds as soon as the new container has started. The gate adds at most `HEALTH_WAIT_SECONDS` to the update of each container, and an update in progress still completes (or rolls back) if the updater is asked to stop.
+Set `HEALTH_WAIT_SECONDS=0` to disable the gate: the update then succeeds as soon as the new container has started. The gate adds at most `HEALTH_WAIT_SECONDS` to the update of each container.
+
+Details:
+
+- A healthcheck verdict takes time. With Docker's default settings (interval 30 s, 3 retries, plus the `start_period`), a broken but still running application is only reported `unhealthy` after about 90 s. Set `HEALTH_WAIT_SECONDS` to at least `start_period + interval * retries` to catch such an application. Crashes and restarts are always caught within a few seconds, whatever the value.
+- A container whose `Health` status is empty or `none` is treated as having no healthcheck.
+- A failed inspection on the very last poll does not fail the gate: the last valid observation is used.
+- A restart count above 0 counts, even if the restart happened before the first observation. The 10 seconds of stability start at the first successful observation.
+- A defective image is not retried: after a gate rollback the updater remembers the pair (container, new image ID) until it restarts, and later scans (including "Scan now") skip that container while the pulled image stays the same, logging "skipping image that previously failed the health gate" without a new event or notification. A different new image ID resets it. Restart the updater to force a retry.
+- Shutdown: if the updater is asked to stop while the gate is running, the gate is abandoned and the update is rolled back at once, with the reason "updater stopping during health gate", so the known-good version is running again quickly. Give the updater a grace period that covers a rollback (about 60 seconds, hence `stop_grace_period: 60s` and `--stop-timeout 60` in the examples above). If the process is killed in the middle of an update (SIGKILL after the grace period, a crash or a power loss), the old container is left stopped as `<name>_old` and the service may be down: start `<name>_old` or recreate the container by hand, then remove the leftover.
 
 ### Cleaning up old images
 
@@ -144,7 +153,10 @@ Pulled images pile up: every update leaves the previous image behind. With `CLEA
 - the removal is best effort and never makes an update fail: the daemon refuses when another container still uses the image (for example several containers on the same image that are not updated yet, or an opted-out one), and the image is then simply kept for now;
 - the image is not removed when it is the same as the new one;
 - nothing is removed after a rollback, since the previous image is the one running again;
-- if the old container could not be removed, its image is kept too.
+- if the old container could not be removed, its image is kept too;
+- the old image is only removed when it carries no tag any more (it was untagged when the pull moved the tag). An image that still has a tag is kept.
+
+In the integration test the updater removes the old image on both the classic and the containerd image stores. Should a store drop the old image on its own when the tag moves, there is nothing left to remove and the updater only logs it at debug level.
 
 It is off by default.
 
@@ -337,6 +349,7 @@ Behind a reverse proxy, the proxy must forward the original `Host` header, becau
 - Ordering between containers (`depends_on`) is not handled.
 - The updater never updates itself, it only notifies.
 - If an update is interrupted, a leftover `<name>_old` container must be removed manually.
+- If the old container has a restart policy such as `always` and the Docker daemon restarts during the health gate, the daemon can start `<name>_old` again next to the new container (for example with a port conflict): stop and remove `<name>_old` manually.
 - Static MAC addresses are not preserved.
 - Only the Unix socket on Linux/Unix is supported.
 
