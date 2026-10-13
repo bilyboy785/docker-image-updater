@@ -2,16 +2,36 @@
 package docker
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
 
+// Container is one entry of the container list.
 type Container struct {
 	ID      string `json:"Id"`
 	Names   []string
 	Image   string
 	ImageID string
 	Labels  map[string]string
+	// NetworkMode is the container's HostConfig.NetworkMode (for example "bridge" or "container:<id>").
+	NetworkMode string `json:"-"`
+}
+
+// UnmarshalJSON decodes a container list entry, lifting HostConfig.NetworkMode into NetworkMode.
+func (c *Container) UnmarshalJSON(b []byte) error {
+	type plain Container
+	aux := struct {
+		*plain
+		HostConfig struct {
+			NetworkMode string
+		}
+	}{plain: (*plain)(c)}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	c.NetworkMode = aux.HostConfig.NetworkMode
+	return nil
 }
 
 // Name returns the container name without the leading slash.
@@ -22,6 +42,7 @@ func (c Container) Name() string {
 	return strings.TrimPrefix(c.Names[0], "/")
 }
 
+// Mount describes one mount of an inspected container.
 type Mount struct {
 	Type        string
 	Name        string
@@ -42,11 +63,13 @@ type ContainerInfo struct {
 	}
 }
 
+// APIError is an error response returned by the Docker daemon.
 type APIError struct {
 	Status  int
 	Message string
 }
 
+// Error implements the error interface.
 func (e *APIError) Error() string {
 	return fmt.Sprintf("docker API error %d: %s", e.Status, e.Message)
 }

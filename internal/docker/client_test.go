@@ -21,13 +21,13 @@ func TestListContainers(t *testing.T) {
 		if r.Method != "GET" || r.URL.Path != "/containers/json" {
 			t.Errorf("unexpected %s %s", r.Method, r.URL)
 		}
-		w.Write([]byte(`[{"Id":"abc","Names":["/web"],"Image":"nginx:latest","ImageID":"sha256:111","Labels":{"a":"b"}}]`))
+		w.Write([]byte(`[{"Id":"abc","Names":["/web"],"Image":"nginx:latest","ImageID":"sha256:111","Labels":{"a":"b"},"HostConfig":{"NetworkMode":"container:xyz"}}]`))
 	})
 	got, err := c.ListContainers(context.Background())
 	if err != nil || len(got) != 1 {
 		t.Fatalf("%v %v", got, err)
 	}
-	if got[0].Name() != "web" || got[0].ImageID != "sha256:111" || got[0].Labels["a"] != "b" {
+	if got[0].Name() != "web" || got[0].ImageID != "sha256:111" || got[0].Labels["a"] != "b" || got[0].NetworkMode != "container:xyz" {
 		t.Fatalf("%+v", got[0])
 	}
 }
@@ -138,5 +138,31 @@ func TestAPIError(t *testing.T) {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != 404 {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestImageConfig(t *testing.T) {
+	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/images/sha256:111/json" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL)
+		}
+		w.Write([]byte(`{"Id":"sha256:111","Config":{"Env":["A=1"],"Cmd":["run"]}}`))
+	})
+	cfg, err := c.ImageConfig(context.Background(), "sha256:111")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env, _ := cfg["Env"].([]any); len(env) != 1 || env[0] != "A=1" || cfg["Cmd"] == nil {
+		t.Fatalf("%v", cfg)
+	}
+}
+
+func TestImageConfigNotFound(t *testing.T) {
+	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no such image", 404)
+	})
+	var ae *APIError
+	if _, err := c.ImageConfig(context.Background(), "gone"); !errors.As(err, &ae) || ae.Status != 404 {
+		t.Fatalf("%v", err)
 	}
 }
