@@ -41,12 +41,17 @@ type schedEnv struct {
 }
 
 func newSchedEnv(t *testing.T, interval time.Duration, block bool) *schedEnv {
+	return newSchedEnvErr(t, interval, block, nil)
+}
+
+func newSchedEnvErr(t *testing.T, interval time.Duration, block bool, runErr error) *schedEnv {
 	t.Helper()
 	e := &schedEnv{
 		clock:    &fakeClock{t: time.Unix(1_000_000, 0)},
 		started:  make(chan struct{}, 100),
 		release:  make(chan struct{}, 100),
 		block:    block,
+		runErr:   runErr,
 		scanning: make(chan bool, 100),
 		nexts:    make(chan time.Time, 100),
 		done:     make(chan struct{}),
@@ -169,10 +174,10 @@ func TestSchedulerPeriodicScans(t *testing.T) {
 }
 
 func TestSchedulerErrorsDoNotStopLoop(t *testing.T) {
-	e := newSchedEnv(t, 5*time.Millisecond, false)
-	e.runErr = errors.New("boom")
-	waitCh(t, e.started, "first scan")
-	waitCh(t, e.started, "second scan")
+	e := newSchedEnvErr(t, 5*time.Millisecond, false, errors.New("boom"))
+	waitCh(t, e.started, "first (failing) scan")
+	waitCh(t, e.started, "scan after a failing one")
+	waitCh(t, e.started, "another scan after a failing one")
 }
 
 func TestSchedulerCancelStopsRunPromptly(t *testing.T) {

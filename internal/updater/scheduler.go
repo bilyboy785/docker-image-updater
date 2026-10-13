@@ -107,14 +107,21 @@ func (s *Scheduler) end() {
 	s.mu.Unlock()
 }
 
+// scan runs one scan; the running state and the scanning flag are always reset, even if run panics.
+func (s *Scheduler) scan(ctx context.Context) error {
+	s.begin()
+	s.onScanning(true)
+	defer func() {
+		s.onScanning(false)
+		s.end()
+	}()
+	return s.run(ctx)
+}
+
 // Run scans immediately, then waits for the interval or a trigger, until ctx is cancelled.
 func (s *Scheduler) Run(ctx context.Context) {
 	for {
-		s.begin()
-		s.onScanning(true)
-		err := s.run(ctx)
-		s.onScanning(false)
-		s.end()
+		err := s.scan(ctx)
 		if err != nil && ctx.Err() == nil {
 			s.log.Error("scan failed", "error", err)
 		}
