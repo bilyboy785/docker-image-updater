@@ -139,15 +139,18 @@ function render(s) {
   }
 }
 
-let timer = null, scanning = false, posting = false, awaitStart = 0;
+let timer = null, scanning = false, posting = false, awaitStart = 0, inflight = false;
 const setButton = () => {
   const busy = scanning || posting || awaitStart > 0;
-  $('scan').disabled = busy;
-  $('scan').textContent = busy ? 'Scanning…' : 'Scan now';
+  const btn = $('scan');
+  btn.disabled = busy;
+  btn.textContent = busy ? 'Scanning…' : 'Scan now';
 };
 const schedule = ms => { clearTimeout(timer); timer = setTimeout(refresh, ms); };
 
 async function refresh() {
+  if (inflight) return;
+  inflight = true;
   let next = 10000;
   try {
     const r = await fetch('/api/stats', {cache: 'no-store'});
@@ -160,13 +163,22 @@ async function refresh() {
     if (scanning || awaitStart > 0) next = 1000;
     $('dot').className = 'dot'; $('conn').textContent = 'live';
   } catch (_) {
+    scanning = false; awaitStart = 0;
     $('dot').className = 'dot off'; $('conn').textContent = 'offline';
   }
+  inflight = false;
+  const wasBusy = $('scan').disabled;
   setButton();
+  if (wasBusy && !$('scan').disabled) $('scanmsg').textContent = '';
   schedule(next);
 }
 
-const SCAN_MESSAGES = {409: 'A scan is already running', 429: 'Please wait before scanning again', 501: 'Manual scans are not available'};
+const SCAN_MESSAGES = {
+  403: 'Request refused (HTTP 403). If you are behind a reverse proxy, make sure it forwards the original Host header.',
+  409: 'A scan is already running',
+  429: 'Please wait before scanning again',
+  501: 'Manual scans are not available'
+};
 async function scanNow() {
   if (posting) return;
   posting = true; setButton();
@@ -179,6 +191,8 @@ async function scanNow() {
     $('scanmsg').textContent = 'Could not start a scan';
   }
   posting = false;
+  setButton();
+  clearTimeout(timer);
   refresh();
 }
 $('scan').addEventListener('click', scanNow);

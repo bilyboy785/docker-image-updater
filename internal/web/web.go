@@ -24,8 +24,11 @@ const csp = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-i
 type ScanStatus int
 
 const (
+	// ScanStarted means the scan request was accepted.
 	ScanStarted ScanStatus = iota
+	// ScanAlreadyRunning means a scan is already in progress.
 	ScanAlreadyRunning
+	// ScanTooSoon means the last scan started too recently; see ScanResult.RetryAfter.
 	ScanTooSoon
 )
 
