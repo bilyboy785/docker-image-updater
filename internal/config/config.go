@@ -21,6 +21,7 @@ type Config struct {
 	StateFile     string        // statistics persistence file; empty disables persistence
 	Socket        string        // Docker socket path
 	DockerConfig  string        // directory containing the Docker config.json with registry credentials; empty disables it
+	HealthWait    time.Duration // how long a new container is observed before the update is accepted; 0 disables the gate
 }
 
 func envOr(getenv func(string) string, key, def string) string {
@@ -33,9 +34,12 @@ func envOr(getenv func(string) string, key, def string) string {
 // maxIntervalMinutes caps the check interval at one year.
 const maxIntervalMinutes = 525600
 
+// maxHealthWaitSeconds caps the post-start health gate at ten minutes.
+const maxHealthWaitSeconds = 600
+
 // flags holds the parsed values of every setting, before validation.
 type flags struct {
-	interval, token, chat, dry, web, addr, state, sock, dockerCfg *string
+	interval, token, chat, dry, web, addr, state, sock, dockerCfg, healthWait *string
 }
 
 // newFlagSet declares every flag. Environment variables provide the defaults.
@@ -43,15 +47,16 @@ func newFlagSet(getenv func(string) string) (*flag.FlagSet, flags) {
 	fs := flag.NewFlagSet("docker-image-updater", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	return fs, flags{
-		interval:  fs.String("interval", envOr(getenv, "CHECK_INTERVAL_MINUTES", "60"), "check interval in minutes, 1 to 525600 (env CHECK_INTERVAL_MINUTES)"),
-		token:     fs.String("telegram-token", getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token (env TELEGRAM_BOT_TOKEN)"),
-		chat:      fs.String("telegram-chat", getenv("TELEGRAM_CHAT_ID"), "Telegram chat ID (env TELEGRAM_CHAT_ID)"),
-		dry:       fs.String("dry-run", envOr(getenv, "DRY_RUN", "false"), "only notify, never recreate containers (env DRY_RUN)"),
-		web:       fs.String("web", envOr(getenv, "WEB_ENABLED", "false"), "enable the stats web server (env WEB_ENABLED)"),
-		addr:      fs.String("web-addr", envOr(getenv, "WEB_ADDR", ":8080"), "web server listen address (env WEB_ADDR)"),
-		state:     fs.String("state-file", getenv("STATE_FILE"), "file used to persist statistics (env STATE_FILE)"),
-		sock:      fs.String("socket", envOr(getenv, "DOCKER_SOCKET", "/var/run/docker.sock"), "Docker socket path (env DOCKER_SOCKET)"),
-		dockerCfg: fs.String("docker-config", getenv("DOCKER_CONFIG"), "directory containing config.json with registry credentials (env DOCKER_CONFIG)"),
+		interval:   fs.String("interval", envOr(getenv, "CHECK_INTERVAL_MINUTES", "60"), "check interval in minutes, 1 to 525600 (env CHECK_INTERVAL_MINUTES)"),
+		token:      fs.String("telegram-token", getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token (env TELEGRAM_BOT_TOKEN)"),
+		chat:       fs.String("telegram-chat", getenv("TELEGRAM_CHAT_ID"), "Telegram chat ID (env TELEGRAM_CHAT_ID)"),
+		dry:        fs.String("dry-run", envOr(getenv, "DRY_RUN", "false"), "only notify, never recreate containers (env DRY_RUN)"),
+		web:        fs.String("web", envOr(getenv, "WEB_ENABLED", "false"), "enable the stats web server (env WEB_ENABLED)"),
+		addr:       fs.String("web-addr", envOr(getenv, "WEB_ADDR", ":8080"), "web server listen address (env WEB_ADDR)"),
+		state:      fs.String("state-file", getenv("STATE_FILE"), "file used to persist statistics (env STATE_FILE)"),
+		sock:       fs.String("socket", envOr(getenv, "DOCKER_SOCKET", "/var/run/docker.sock"), "Docker socket path (env DOCKER_SOCKET)"),
+		dockerCfg:  fs.String("docker-config", getenv("DOCKER_CONFIG"), "directory containing config.json with registry credentials (env DOCKER_CONFIG)"),
+		healthWait: fs.String("health-wait", envOr(getenv, "HEALTH_WAIT_SECONDS", "60"), "seconds a new container is watched before the update is accepted, 0 disables the check, 0 to 600 (env HEALTH_WAIT_SECONDS)"),
 	}
 }
 
@@ -69,7 +74,7 @@ func Usage() string {
 // It returns flag.ErrHelp (possibly wrapped) when help was requested.
 func Load(args []string, getenv func(string) string) (Config, error) {
 	fs, f := newFlagSet(getenv)
-	interval, token, chat, dry, web, addr, state, sock, dockerCfg := f.interval, f.token, f.chat, f.dry, f.web, f.addr, f.state, f.sock, f.dockerCfg
+	interval, token, chat, dry, web, addr, state, sock, dockerCfg, healthWait := f.interval, f.token, f.chat, f.dry, f.web, f.addr, f.state, f.sock, f.dockerCfg, f.healthWait
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -77,6 +82,10 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	minutes, err := strconv.Atoi(strings.TrimSpace(*interval))
 	if err != nil || minutes < 1 || minutes > maxIntervalMinutes {
 		return Config{}, fmt.Errorf("invalid check interval %q: must be an integer between 1 and %d (minutes)", *interval, maxIntervalMinutes)
+	}
+	wait, err := strconv.Atoi(strings.TrimSpace(*healthWait))
+	if err != nil || wait < 0 || wait > maxHealthWaitSeconds {
+		return Config{}, fmt.Errorf("invalid HEALTH_WAIT_SECONDS %q: must be an integer between 0 and %d (0 disables the health check)", *healthWait, maxHealthWaitSeconds)
 	}
 	dryRun, err := strconv.ParseBool(*dry)
 	if err != nil {
@@ -102,5 +111,6 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		StateFile:     *state,
 		Socket:        *sock,
 		DockerConfig:  strings.TrimSpace(*dockerCfg),
+		HealthWait:    time.Duration(wait) * time.Second,
 	}, nil
 }

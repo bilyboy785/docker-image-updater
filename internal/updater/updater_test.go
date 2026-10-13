@@ -31,9 +31,11 @@ type fakeDocker struct {
 	oldGoneAfterPull bool // ImageConfig fails once PullImage ran, like the containerd store dropping a replaced image
 	pulled           bool
 	localChecks      int
-	localErr         map[string]error // image id -> error from ImageIsLocal
-	localImages      map[string]bool  // image ids that never came from a registry
-	created          []map[string]any // bodies passed to CreateContainer
+	localErr         map[string]error                           // image id -> error from ImageIsLocal
+	localImages      map[string]bool                            // image ids that never came from a registry
+	created          []map[string]any                           // bodies passed to CreateContainer
+	inspectNew       func(n int) (*docker.ContainerInfo, error) // optional: inspect results of the new container (n counts from 1)
+	inspectNewCalls  int
 }
 
 func (f *fakeDocker) rec(s string)        { f.calls = append(f.calls, s) }
@@ -50,6 +52,11 @@ func (f *fakeDocker) ListContainers(ctx context.Context) ([]docker.Container, er
 func (f *fakeDocker) InspectContainer(ctx context.Context, id string) (*docker.ContainerInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if id == "newid" && f.inspectNew != nil {
+		f.inspectNewCalls++
+		f.rec("inspect newid")
+		return f.inspectNew(f.inspectNewCalls)
 	}
 	return f.info[id], f.fail("Inspect")
 }

@@ -20,6 +20,9 @@ func TestDefaults(t *testing.T) {
 	if c.Interval != 60*time.Minute || c.Socket != "/var/run/docker.sock" || c.WebAddr != ":8080" {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
+	if c.HealthWait != 60*time.Second {
+		t.Fatalf("health wait default: %v", c.HealthWait)
+	}
 	if c.DryRun || c.WebEnabled || c.TelegramToken != "" || c.StateFile != "" || c.DockerConfig != "" {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
@@ -36,11 +39,12 @@ func TestFromEnv(t *testing.T) {
 		"STATE_FILE":             "/data/state.json",
 		"DOCKER_SOCKET":          "/tmp/d.sock",
 		"DOCKER_CONFIG":          " /config ",
+		"HEALTH_WAIT_SECONDS":    "45",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock", "/config"}
+	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock", "/config", 45 * time.Second}
 	if c != want {
 		t.Fatalf("got %+v want %+v", c, want)
 	}
@@ -72,6 +76,9 @@ func TestInvalid(t *testing.T) {
 		"chat only":      {"TELEGRAM_CHAT_ID": "42"},
 		"bad bool":       {"DRY_RUN": "maybe"},
 		"empty web addr": {"WEB_ENABLED": "true", "WEB_ADDR": " "},
+		"negative wait":  {"HEALTH_WAIT_SECONDS": "-1"},
+		"wait too long":  {"HEALTH_WAIT_SECONDS": "601"},
+		"wait not a int": {"HEALTH_WAIT_SECONDS": "soon"},
 	}
 	for name, e := range cases {
 		if _, err := Load(nil, env(e)); err == nil {
@@ -94,7 +101,7 @@ func TestHelpRequested(t *testing.T) {
 func TestUsageListsFlagsEnvVarsAndDefaults(t *testing.T) {
 	u := Usage()
 	for _, want := range []string{"-interval", "CHECK_INTERVAL_MINUTES", "-telegram-token", "TELEGRAM_BOT_TOKEN",
-		"-dry-run", "DRY_RUN", "-web-addr", "WEB_ADDR", "-state-file", "STATE_FILE", "-socket", "DOCKER_SOCKET", "-docker-config", "DOCKER_CONFIG", "/var/run/docker.sock", "60"} {
+		"-dry-run", "DRY_RUN", "-web-addr", "WEB_ADDR", "-state-file", "STATE_FILE", "-socket", "DOCKER_SOCKET", "-docker-config", "DOCKER_CONFIG", "-health-wait", "HEALTH_WAIT_SECONDS", "/var/run/docker.sock", "60"} {
 		if !strings.Contains(u, want) {
 			t.Errorf("usage is missing %q:\n%s", want, u)
 		}
@@ -110,5 +117,17 @@ func TestIntervalIsCapped(t *testing.T) {
 	}
 	if _, err := Load(nil, env(map[string]string{"CHECK_INTERVAL_MINUTES": "99999999999999999999"})); err == nil {
 		t.Fatal("overflowing interval must be rejected")
+	}
+}
+
+func TestHealthWaitBounds(t *testing.T) {
+	for in, want := range map[string]time.Duration{"0": 0, "1": time.Second, "600": 600 * time.Second, " 30 ": 30 * time.Second} {
+		c, err := Load(nil, env(map[string]string{"HEALTH_WAIT_SECONDS": in}))
+		if err != nil || c.HealthWait != want {
+			t.Errorf("%q: %v %v", in, c.HealthWait, err)
+		}
+	}
+	if c, err := Load([]string{"-health-wait", "5"}, env(map[string]string{"HEALTH_WAIT_SECONDS": "30"})); err != nil || c.HealthWait != 5*time.Second {
+		t.Errorf("flag must override env: %v %v", c.HealthWait, err)
 	}
 }

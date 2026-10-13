@@ -63,13 +63,18 @@ type Updater struct {
 
 	apiTimeout  time.Duration
 	pullTimeout time.Duration
+
+	healthWait time.Duration // post-start health gate duration; 0 disables it
+	hnow       func() time.Time
+	hsleep     func(ctx context.Context, d time.Duration)
 }
 
 // New returns an Updater. selfID is the updater's own container id or hostname, used to
 // recognise (and never recreate) its own container.
 func New(d DockerAPI, n notify.Notifier, s *stats.Stats, selfID string, dryRun bool, log *slog.Logger) *Updater {
 	return &Updater{docker: d, notifier: n, stats: s, selfID: selfID, dryRun: dryRun, log: log, notified: map[string]bool{}, now: time.Now,
-		apiTimeout: defaultAPITimeout, pullTimeout: defaultPullTimeout}
+		apiTimeout: defaultAPITimeout, pullTimeout: defaultPullTimeout,
+		hnow: time.Now, hsleep: sleepCtx}
 }
 
 // WithRegistryAuth sets the provider of registry credentials used for pulls (nil: anonymous)
@@ -381,9 +386,16 @@ func (u *Updater) finish(ctx context.Context, ev stats.Event, ref, status, warn 
 		stats.StatusFailed:     "❌ Update failed for",
 		stats.StatusRolledBack: "⚠️ Update failed and was rolled back for",
 	}[status]
+	var gerr *gateError
+	gateRollback := status == stats.StatusRolledBack && errors.As(err, &gerr)
+	if gateRollback {
+		head = "⚠️ Update rolled back for"
+	}
 	msg := fmt.Sprintf("%s <b>%s</b>\nImage: <code>%s</code>\n%s → %s",
 		head, html.EscapeString(ev.Container), html.EscapeString(ref), ev.OldID, ev.NewID)
-	if err != nil {
+	if gateRollback {
+		msg += "\nRolled back to the previous image: " + html.EscapeString(gerr.reason)
+	} else if err != nil {
 		msg += "\nError: " + html.EscapeString(err.Error())
 	}
 	if warn != "" {
@@ -415,7 +427,7 @@ func (u *Updater) recreate(ctx context.Context, c docker.Container, info *docker
 	spec := buildCreateSpec(info, newImageID)
 	name := c.Name()
 
-	opctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+	opctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute+u.healthWait)
 	defer cancel()
 
 	// The inspected config merges the old image's defaults with the container's own settings:
@@ -457,9 +469,20 @@ func (u *Updater) recreate(ctx context.Context, c docker.Container, info *docker
 		st, e := u.rollback(opctx, c, name, newID, fmt.Errorf("start new container: %w", err))
 		return st, "", e
 	}
+	note, gerr := u.waitHealthy(opctx, newID, u.healthWait)
+	if gerr != nil {
+		st, e := u.rollback(opctx, c, name, newID, gerr)
+		return st, "", e
+	}
 	if err := u.docker.RemoveContainer(opctx, c.ID, false); err != nil {
 		u.log.Warn("could not remove old container", "container", name+"_old", "error", err)
 		warn = fmt.Sprintf("Warning: the old container %s_old could not be removed and must be removed manually.", name)
+	}
+	if note != "" {
+		if warn != "" {
+			warn += "\n"
+		}
+		warn += note
 	}
 	return stats.StatusUpdated, warn, nil
 }
