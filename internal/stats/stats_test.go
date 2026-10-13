@@ -136,11 +136,74 @@ func TestScanningIsNotPersisted(t *testing.T) {
 	}
 }
 
-func TestScanningJSONKeyIsLast(t *testing.T) {
+func TestScanningJSONKeyPrecedesContainers(t *testing.T) {
 	s, _ := New("v", "active", "")
 	s.SetScanning(true)
 	b, _ := json.Marshal(s.Snapshot())
-	if !strings.HasSuffix(string(b), `,"scanning":true}`) {
-		t.Fatalf("scanning must be the last key: %s", b)
+	if !strings.HasSuffix(string(b), `,"scanning":true,"containers":[]}`) {
+		t.Fatalf("scanning must be the last key before containers: %s", b)
+	}
+}
+
+func TestSetContainersSortsByNameAndReplaces(t *testing.T) {
+	s, _ := New("v", "active", "")
+	s.SetContainers([]ContainerStatus{{Name: "b", Status: ContainerUpToDate}, {Name: "a", Status: ContainerUpdated}})
+	got := s.Snapshot().Containers
+	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "b" {
+		t.Fatalf("not sorted: %+v", got)
+	}
+	s.SetContainers([]ContainerStatus{{Name: "c"}})
+	if got := s.Snapshot().Containers; len(got) != 1 || got[0].Name != "c" {
+		t.Fatalf("not replaced: %+v", got)
+	}
+	s.SetContainers(nil)
+	if got := s.Snapshot().Containers; got == nil || len(got) != 0 {
+		t.Fatalf("want an empty non-nil list: %#v", got)
+	}
+}
+
+func TestSetContainersCopiesItsInputAndItsOutput(t *testing.T) {
+	s, _ := New("v", "active", "")
+	in := []ContainerStatus{{Name: "a"}, {Name: "b"}}
+	s.SetContainers(in)
+	in[0].Name = "mutated-in"
+	snap := s.Snapshot()
+	if snap.Containers[0].Name != "a" {
+		t.Fatal("store shares memory with its input")
+	}
+	snap.Containers[0].Name = "mutated-out"
+	if s.Snapshot().Containers[0].Name != "a" {
+		t.Fatal("snapshot shares memory with the store")
+	}
+}
+
+func TestContainersAreNotPersisted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, _ := New("v", "active", path)
+	s.SetContainers([]ContainerStatus{{Name: "secret-name", Status: ContainerUpdated}})
+	s.RecordEvent(Event{Status: StatusUpdated}) // triggers a save
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "secret-name") {
+		t.Fatalf("containers leaked into the state file: %s", b)
+	}
+	s2, _ := New("v", "active", path)
+	if got := s2.Snapshot().Containers; got == nil || len(got) != 0 {
+		t.Fatalf("containers must be empty after a reload: %#v", got)
+	}
+	if len(s.Snapshot().Containers) != 1 {
+		t.Fatal("saving must not clear the live list")
+	}
+}
+
+func TestContainersJSONKeyIsLast(t *testing.T) {
+	s, _ := New("v", "active", "")
+	s.SetContainers([]ContainerStatus{{Name: "a", Image: "i", ImageID: "abc", Status: ContainerSkipped, Detail: "d", Policy: "auto", Window: "w", CheckedAt: time.Unix(0, 0).UTC()}})
+	b, _ := json.Marshal(s.Snapshot())
+	want := `"containers":[{"name":"a","image":"i","image_id":"abc","status":"skipped","detail":"d","policy":"auto","window":"w","checked_at":"1970-01-01T00:00:00Z"}]}`
+	if !strings.HasSuffix(string(b), want) {
+		t.Fatalf("containers must be the last key: %s", b)
 	}
 }

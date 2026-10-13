@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -21,6 +22,36 @@ const (
 
 	maxEvents = 50
 )
+
+// Container statuses shown in the container list.
+const (
+	ContainerUpToDate        = "up-to-date"
+	ContainerUpdated         = "updated"
+	ContainerUpdateAvailable = "update-available"
+	ContainerWaitingWindow   = "waiting-window"
+	ContainerFailed          = "failed"
+	ContainerRolledBack      = "rolled-back"
+	ContainerSkipped         = "skipped"
+	ContainerSelf            = "self"
+)
+
+// ContainerStatuses lists every container status, in display order.
+var ContainerStatuses = []string{
+	ContainerUpToDate, ContainerUpdated, ContainerUpdateAvailable, ContainerWaitingWindow,
+	ContainerFailed, ContainerRolledBack, ContainerSkipped, ContainerSelf,
+}
+
+// ContainerStatus is what the last scan found about one container. It is never persisted.
+type ContainerStatus struct {
+	Name      string    `json:"name"`
+	Image     string    `json:"image"`
+	ImageID   string    `json:"image_id"` // short (12 hex)
+	Status    string    `json:"status"`
+	Detail    string    `json:"detail"`
+	Policy    string    `json:"policy"` // "auto" or "notify"
+	Window    string    `json:"window"` // raw window label, or ""
+	CheckedAt time.Time `json:"checked_at"`
+}
 
 // Event is one entry of the activity history.
 type Event struct {
@@ -49,6 +80,8 @@ type Snapshot struct {
 	Rollbacks  int       `json:"rollbacks"`
 	Events     []Event   `json:"events"`
 	Scanning   bool      `json:"scanning"`
+	// Containers must stay the last field: consumers rely on the JSON key order.
+	Containers []ContainerStatus `json:"containers"`
 }
 
 // Stats is a concurrency-safe store of counters and recent events, optionally persisted to a file.
@@ -60,7 +93,7 @@ type Stats struct {
 
 // New returns a usable store even when the state file is corrupt; the error only reports that.
 func New(version, mode, path string) (*Stats, error) {
-	s := &Stats{path: path, snap: Snapshot{Version: version, Mode: mode, StartedAt: time.Now(), Events: []Event{}}}
+	s := &Stats{path: path, snap: Snapshot{Version: version, Mode: mode, StartedAt: time.Now(), Events: []Event{}, Containers: []ContainerStatus{}}}
 	if path == "" {
 		return s, nil
 	}
@@ -108,6 +141,15 @@ func (s *Stats) SetScanning(v bool) {
 	s.snap.Scanning = v
 }
 
+// SetContainers replaces the container list (sorted by name). It is never persisted.
+func (s *Stats) SetContainers(list []ContainerStatus) {
+	cp := append([]ContainerStatus{}, list...)
+	sort.SliceStable(cp, func(i, j int) bool { return cp[i].Name < cp[j].Name })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap.Containers = cp
+}
+
 // RecordEvent adds an event to the history (newest first, bounded) and updates the counters.
 func (s *Stats) RecordEvent(e Event) {
 	s.mu.Lock()
@@ -136,6 +178,7 @@ func (s *Stats) Snapshot() Snapshot {
 	defer s.mu.Unlock()
 	out := s.snap
 	out.Events = append([]Event(nil), s.snap.Events...)
+	out.Containers = append([]ContainerStatus{}, s.snap.Containers...)
 	return out
 }
 
@@ -146,6 +189,7 @@ func (s *Stats) saveLocked() {
 	}
 	persisted := s.snap
 	persisted.Scanning = false
+	persisted.Containers = nil
 	b, err := json.Marshal(persisted)
 	if err == nil {
 		tmp := filepath.Join(filepath.Dir(s.path), "."+filepath.Base(s.path)+".tmp")
