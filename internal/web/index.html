@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>docker-image-updater</title>
+<style>
+:root{--bg:#0b0e14;--panel:#121722;--panel2:#171d2b;--border:#232b3e;--text:#e6e9f2;--muted:#8b93a7;--accent:#5b8cff;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--info:#60a5fa}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6fb;--panel:#fff;--panel2:#f0f2f8;--border:#e1e5ef;--text:#161a26;--muted:#667089;--accent:#3b6df0;--ok:#047857;--warn:#b45309;--bad:#dc2626;--info:#2563eb}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+ background:radial-gradient(900px 420px at 85% -10%,color-mix(in srgb,var(--accent) 22%,transparent),transparent),var(--bg)}
+main{max-width:1040px;margin:0 auto;padding:32px 16px 48px}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;justify-content:space-between;margin-bottom:28px}
+h1{margin:0;font-size:22px;letter-spacing:-.01em;display:flex;align-items:center;gap:10px}
+.logo{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--accent),#8b5cf6);display:grid;place-items:center;color:#fff;font-size:16px}
+.badges{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.badge{font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--muted)}
+.live{display:inline-flex;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 60%,transparent);animation:pulse 2s infinite}
+.dot.off{background:var(--bad);animation:none}
+@keyframes pulse{70%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));margin-bottom:28px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
+.card .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}
+.card .value{font-size:30px;font-weight:650;letter-spacing:-.02em;margin-top:4px;font-variant-numeric:tabular-nums}
+.card .sub{color:var(--muted);font-size:13px;margin-top:2px}
+.card.accent .value{color:var(--accent)}.card.ok .value{color:var(--ok)}.card.bad .value{color:var(--bad)}
+section h2{font-size:15px;margin:0 0 12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+.table{background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:640px}
+th,td{text-align:left;padding:11px 16px;border-bottom:1px solid var(--border);white-space:nowrap}
+th{font-size:12px;color:var(--muted);font-weight:600;background:var(--panel2);text-transform:uppercase;letter-spacing:.05em}
+tr:last-child td{border-bottom:0}
+td.mono,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+td.err{white-space:normal;color:var(--bad);font-size:13px;max-width:320px}
+.pill{font-size:12px;font-weight:600;padding:2px 10px;border-radius:999px;border:1px solid transparent}
+.pill.updated{color:var(--ok);background:color-mix(in srgb,var(--ok) 14%,transparent)}
+.pill.failed{color:var(--bad);background:color-mix(in srgb,var(--bad) 14%,transparent)}
+.pill.rolled_back{color:var(--warn);background:color-mix(in srgb,var(--warn) 16%,transparent)}
+.pill.available{color:var(--info);background:color-mix(in srgb,var(--info) 14%,transparent)}
+.empty{padding:36px 16px;text-align:center;color:var(--muted)}
+footer{margin-top:22px;color:var(--muted);font-size:13px;text-align:center}
+</style>
+</head>
+<body>
+<main>
+ <header>
+  <h1><span class="logo">⟳</span>docker-image-updater</h1>
+  <div class="badges">
+   <span class="badge live"><span class="dot" id="dot"></span><span id="conn">live</span></span>
+   <span class="badge" id="mode">—</span>
+   <span class="badge mono" id="version">—</span>
+  </div>
+ </header>
+
+ <div class="grid">
+  <div class="card accent"><div class="label">Scans</div><div class="value" id="scans">0</div><div class="sub" id="lastscan">Last scan: —</div></div>
+  <div class="card"><div class="label">Watched containers</div><div class="value" id="watched">0</div><div class="sub" id="skipped">0 skipped</div></div>
+  <div class="card ok"><div class="label">Updates applied</div><div class="value" id="updates">0</div><div class="sub">since first start</div></div>
+  <div class="card bad"><div class="label">Failures</div><div class="value" id="failures">0</div><div class="sub" id="rollbacks">0 rolled back</div></div>
+  <div class="card"><div class="label">Next scan</div><div class="value" id="nextscan" style="font-size:22px;padding-top:6px">—</div><div class="sub" id="lastdur">Last scan took —</div></div>
+ </div>
+
+ <section>
+  <h2>Recent activity</h2>
+  <div class="table"><div class="scroll">
+   <table>
+    <thead><tr><th>Time</th><th>Container</th><th>Image</th><th>Change</th><th>Status</th><th>Error</th></tr></thead>
+    <tbody id="events"></tbody>
+   </table>
+  </div>
+  <div class="empty" id="empty" hidden>No update activity yet.</div></div>
+ </section>
+ <footer id="uptime">—</footer>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const valid = s => { const d = new Date(s); return isNaN(d) || d.getFullYear() < 2000 ? null : d; };
+const when = s => { const d = valid(s); return d ? d.toLocaleString() : '—'; };
+const rtf = new Intl.RelativeTimeFormat(undefined, {numeric: 'auto'});
+const rel = s => {
+  const d = valid(s); if (!d) return '—';
+  const t = Math.round((d - Date.now()) / 1000), a = Math.abs(t);
+  if (a < 60) return rtf.format(t, 'second');
+  if (a < 3600) return rtf.format(Math.round(t / 60), 'minute');
+  if (a < 86400) return rtf.format(Math.round(t / 3600), 'hour');
+  return rtf.format(Math.round(t / 86400), 'day');
+};
+const dur = ms => ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s';
+const uptime = s => {
+  const d = valid(s); if (!d) return '—';
+  let t = Math.floor((Date.now() - d) / 1000);
+  const days = Math.floor(t / 86400); t %= 86400;
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60);
+  return (days ? days + 'd ' : '') + h + 'h ' + m + 'm';
+};
+const cell = (tr, text, cls) => { const td = document.createElement('td'); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); return td; };
+
+function render(s) {
+  $('version').textContent = s.version;
+  $('mode').textContent = s.mode;
+  $('scans').textContent = s.scans;
+  $('lastscan').textContent = 'Last scan: ' + rel(s.last_scan);
+  $('watched').textContent = s.watched;
+  $('skipped').textContent = s.skipped + ' skipped';
+  $('updates').textContent = s.updates;
+  $('failures').textContent = s.failures;
+  $('rollbacks').textContent = s.rollbacks + ' rolled back';
+  $('nextscan').textContent = rel(s.next_scan);
+  $('lastdur').textContent = 'Last scan took ' + (s.scans ? dur(s.last_scan_ms) : '—');
+  $('uptime').textContent = 'Uptime ' + uptime(s.started_at);
+  const body = $('events');
+  body.replaceChildren();
+  const events = s.events || [];
+  $('empty').hidden = events.length > 0;
+  for (const e of events) {
+    const tr = document.createElement('tr');
+    cell(tr, when(e.time));
+    cell(tr, e.container, 'mono');
+    cell(tr, e.image, 'mono');
+    cell(tr, e.old_id + ' → ' + e.new_id, 'mono');
+    const pill = document.createElement('span');
+    pill.className = 'pill ' + e.status; pill.textContent = e.status.replace('_', ' ');
+    cell(tr, '').appendChild(pill);
+    cell(tr, e.error || '', 'err');
+    body.appendChild(tr);
+  }
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/stats', {cache: 'no-store'});
+    if (!r.ok) throw new Error(r.status);
+    render(await r.json());
+    $('dot').className = 'dot'; $('conn').textContent = 'live';
+  } catch (_) {
+    $('dot').className = 'dot off'; $('conn').textContent = 'offline';
+  }
+}
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>
