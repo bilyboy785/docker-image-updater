@@ -168,3 +168,35 @@ func TestHealthzAProgressOlderThanTheLastScanIsIgnored(t *testing.T) {
 		t.Fatalf("%d %q", rec.Code, rec.Body.String())
 	}
 }
+
+func TestCheckHealthDoesNotFollowRedirects(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) }))
+	defer target.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer srv.Close()
+	err := CheckHealth(strings.TrimPrefix(srv.URL, "http://"), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "302") {
+		t.Fatalf("a redirect is not a healthy answer: %v", err)
+	}
+}
+
+func TestCheckHealthIgnoresProxyEnvironment(t *testing.T) {
+	// A closed port: a probe that went through this proxy would fail.
+	for _, k := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY"} {
+		t.Setenv(k, "http://127.0.0.1:1")
+	}
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) }))
+	defer srv.Close()
+	if err := CheckHealth(strings.TrimPrefix(srv.URL, "http://"), time.Second); err != nil {
+		t.Fatalf("the probe must ignore proxy variables: %v", err)
+	}
+	// The standard library never proxies loopback addresses, so also check the configuration.
+	tr, ok := healthClient().Transport.(*http.Transport)
+	if !ok || tr.Proxy != nil {
+		t.Fatalf("the probe client must not use a proxy: %#v", healthClient().Transport)
+	}
+}

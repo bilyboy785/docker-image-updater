@@ -52,6 +52,15 @@ func LocalAddr(listen string) (string, error) {
 	return net.JoinHostPort(host, port), nil
 }
 
+// healthClient is the HTTP client of the probe: it never uses a proxy (the probe targets this very
+// host, whatever HTTP_PROXY says) and never follows a redirect.
+func healthClient() *http.Client {
+	return &http.Client{
+		Transport:     &http.Transport{Proxy: nil},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
 // CheckHealth performs GET /healthz against the web server listening on listen and returns an
 // error unless it answers 200 within timeout.
 func CheckHealth(listen string, timeout time.Duration) error {
@@ -65,7 +74,7 @@ func CheckHealth(listen string, timeout time.Duration) error {
 	if err != nil {
 		return err
 	}
-	resp, err := (&http.Client{}).Do(req)
+	resp, err := healthClient().Do(req)
 	if err != nil {
 		return err
 	}
