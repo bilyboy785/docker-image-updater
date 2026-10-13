@@ -33,3 +33,21 @@ func TestRunHealthcheckDisabledWebServerIsHealthy(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestConfigErrorExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{nil, 2},
+		{[]string{"-interval", "0"}, 2},
+		{[]string{"-healthcheck", "-interval", "0"}, 1},
+		{[]string{"--healthcheck"}, 1},
+		{[]string{"-interval", "0", "-healthcheck=true"}, 1},
+		{[]string{"-healthcheck=false", "-interval", "0"}, 2},
+	} {
+		if got := configErrorExitCode(tc.args); got != tc.want {
+			t.Errorf("%v: got %d want %d", tc.args, got, tc.want)
+		}
+	}
+}

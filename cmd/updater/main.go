@@ -32,7 +32,7 @@ func main() {
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "configuration error:", err)
-		os.Exit(2)
+		os.Exit(configErrorExitCode(os.Args[1:]))
 	}
 	if cfg.HealthCheck {
 		if err := runHealthcheck(cfg, 3*time.Second); err != nil {
@@ -96,6 +96,18 @@ func main() {
 	if queue != nil {
 		queue.Close(10 * time.Second)
 	}
+}
+
+// configErrorExitCode is the exit code for a configuration error: 2, or 1 in -healthcheck mode,
+// where every failure, a misconfigured probe included, must read as "unhealthy" (exit 1).
+func configErrorExitCode(args []string) int {
+	for _, a := range args {
+		switch a {
+		case "-healthcheck", "--healthcheck", "-healthcheck=true", "--healthcheck=true":
+			return 1
+		}
+	}
+	return 2
 }
 
 // runHealthcheck probes the local web server's /healthz. With the web server disabled there is
