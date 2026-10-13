@@ -28,4 +28,6 @@ LABEL org.opencontainers.image.title="docker-image-updater" \
       org.opencontainers.image.source="https://github.com/bilyboy785/docker-image-updater" \
       org.opencontainers.image.licenses="MIT" \
       docker-image-updater.self="true"
+# Probes /healthz of the built-in web server (succeeds at once when the web server is disabled).
+HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 CMD ["/docker-image-updater","-healthcheck"]
 ENTRYPOINT ["/docker-image-updater"]

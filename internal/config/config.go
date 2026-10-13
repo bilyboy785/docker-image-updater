@@ -23,6 +23,7 @@ type Config struct {
 	DockerConfig  string        // directory containing the Docker config.json with registry credentials; empty disables it
 	CleanupImages bool          // remove the previous image after a successful update
 	HealthWait    time.Duration // how long a new container is observed before the update is accepted; 0 disables the gate
+	HealthCheck   bool          // probe the local web server's /healthz and exit (used by the image HEALTHCHECK)
 }
 
 func envOr(getenv func(string) string, key, def string) string {
@@ -41,6 +42,7 @@ const maxHealthWaitSeconds = 600
 // flags holds the parsed values of every setting, before validation.
 type flags struct {
 	interval, token, chat, dry, web, addr, state, sock, dockerCfg, healthWait, cleanup *string
+	healthcheck                                                                        *bool
 }
 
 // newFlagSet declares every flag. Environment variables provide the defaults.
@@ -48,17 +50,18 @@ func newFlagSet(getenv func(string) string) (*flag.FlagSet, flags) {
 	fs := flag.NewFlagSet("docker-image-updater", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	return fs, flags{
-		interval:   fs.String("interval", envOr(getenv, "CHECK_INTERVAL_MINUTES", "60"), "check interval in minutes, 1 to 525600 (env CHECK_INTERVAL_MINUTES)"),
-		token:      fs.String("telegram-token", getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token (env TELEGRAM_BOT_TOKEN)"),
-		chat:       fs.String("telegram-chat", getenv("TELEGRAM_CHAT_ID"), "Telegram chat ID (env TELEGRAM_CHAT_ID)"),
-		dry:        fs.String("dry-run", envOr(getenv, "DRY_RUN", "false"), "only notify, never recreate containers (env DRY_RUN)"),
-		web:        fs.String("web", envOr(getenv, "WEB_ENABLED", "false"), "enable the stats web server (env WEB_ENABLED)"),
-		addr:       fs.String("web-addr", envOr(getenv, "WEB_ADDR", ":8080"), "web server listen address (env WEB_ADDR)"),
-		state:      fs.String("state-file", getenv("STATE_FILE"), "file used to persist statistics (env STATE_FILE)"),
-		sock:       fs.String("socket", envOr(getenv, "DOCKER_SOCKET", "/var/run/docker.sock"), "Docker socket path (env DOCKER_SOCKET)"),
-		dockerCfg:  fs.String("docker-config", getenv("DOCKER_CONFIG"), "directory containing config.json with registry credentials (env DOCKER_CONFIG)"),
-		healthWait: fs.String("health-wait", envOr(getenv, "HEALTH_WAIT_SECONDS", "60"), "seconds a new container is watched before the update is accepted, 0 disables the check, 0 to 600 (env HEALTH_WAIT_SECONDS)"),
-		cleanup:    fs.String("cleanup-images", envOr(getenv, "CLEANUP_IMAGES", "false"), "remove the previous image after a successful update (env CLEANUP_IMAGES)"),
+		interval:    fs.String("interval", envOr(getenv, "CHECK_INTERVAL_MINUTES", "60"), "check interval in minutes, 1 to 525600 (env CHECK_INTERVAL_MINUTES)"),
+		token:       fs.String("telegram-token", getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token (env TELEGRAM_BOT_TOKEN)"),
+		chat:        fs.String("telegram-chat", getenv("TELEGRAM_CHAT_ID"), "Telegram chat ID (env TELEGRAM_CHAT_ID)"),
+		dry:         fs.String("dry-run", envOr(getenv, "DRY_RUN", "false"), "only notify, never recreate containers (env DRY_RUN)"),
+		web:         fs.String("web", envOr(getenv, "WEB_ENABLED", "false"), "enable the stats web server (env WEB_ENABLED)"),
+		addr:        fs.String("web-addr", envOr(getenv, "WEB_ADDR", ":8080"), "web server listen address (env WEB_ADDR)"),
+		state:       fs.String("state-file", getenv("STATE_FILE"), "file used to persist statistics (env STATE_FILE)"),
+		sock:        fs.String("socket", envOr(getenv, "DOCKER_SOCKET", "/var/run/docker.sock"), "Docker socket path (env DOCKER_SOCKET)"),
+		dockerCfg:   fs.String("docker-config", getenv("DOCKER_CONFIG"), "directory containing config.json with registry credentials (env DOCKER_CONFIG)"),
+		healthWait:  fs.String("health-wait", envOr(getenv, "HEALTH_WAIT_SECONDS", "60"), "seconds a new container is watched before the update is accepted, 0 disables the check, 0 to 600 (env HEALTH_WAIT_SECONDS)"),
+		cleanup:     fs.String("cleanup-images", envOr(getenv, "CLEANUP_IMAGES", "false"), "remove the previous image after a successful update (env CLEANUP_IMAGES)"),
+		healthcheck: fs.Bool("healthcheck", false, "probe the local web server's /healthz, exit 0 when healthy (or when the web server is disabled) and 1 otherwise; used by the image HEALTHCHECK"),
 	}
 }
 
@@ -119,5 +122,6 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		DockerConfig:  strings.TrimSpace(*dockerCfg),
 		HealthWait:    time.Duration(wait) * time.Second,
 		CleanupImages: cleanupImages,
+		HealthCheck:   *f.healthcheck,
 	}, nil
 }

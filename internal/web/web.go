@@ -67,8 +67,19 @@ func sameOrigin(r *http.Request) bool {
 type Option func(*options)
 
 type options struct {
-	now func() time.Time
+	now      func() time.Time
+	interval time.Duration // scan interval used by the /healthz staleness rule; 0 disables the rule
 }
+
+// WithHealth makes /healthz report 503 when the scan loop looks dead: no scan completed within
+// two scan intervals plus staleSlack (the time reserved for a slow scan) of the last scan's end,
+// or of the process start while no scan has completed yet. Without it /healthz always answers 200.
+func WithHealth(interval time.Duration) Option {
+	return func(o *options) { o.interval = interval }
+}
+
+// staleSlack covers the 30 minute image pull timeout of the scan in progress, and then some.
+const staleSlack = 35 * time.Minute
 
 // WithClock sets the clock used for time-dependent output (default time.Now).
 func WithClock(now func() time.Time) Option {
@@ -128,6 +139,12 @@ func Handler(snap func() stats.Snapshot, trigger func() ScanResult, opts ...Opti
 	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		if msg := o.staleness(snap(), o.now()); msg != "" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(msg))
+			return
+		}
 		w.Write([]byte("ok"))
 	})
 	return mux

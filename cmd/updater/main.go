@@ -34,6 +34,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "configuration error:", err)
 		os.Exit(2)
 	}
+	if cfg.HealthCheck {
+		if err := runHealthcheck(cfg, 3*time.Second); err != nil {
+			fmt.Fprintln(os.Stderr, "unhealthy:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
 	if tzUnrecognised(os.Getenv("TZ"), time.Local.String()) {
@@ -71,7 +78,7 @@ func main() {
 	if cfg.WebEnabled {
 		go func() {
 			log.Info("web server listening", "addr", cfg.WebAddr)
-			if err := web.Serve(ctx, cfg.WebAddr, web.Handler(st.Snapshot, func() web.ScanResult { return triggerScan(sched) })); err != nil {
+			if err := web.Serve(ctx, cfg.WebAddr, web.Handler(st.Snapshot, func() web.ScanResult { return triggerScan(sched) }, web.WithHealth(cfg.Interval))); err != nil {
 				log.Error("web server stopped", "error", err)
 			}
 		}()
@@ -89,6 +96,15 @@ func main() {
 	if queue != nil {
 		queue.Close(10 * time.Second)
 	}
+}
+
+// runHealthcheck probes the local web server's /healthz. With the web server disabled there is
+// nothing to check and it succeeds.
+func runHealthcheck(cfg config.Config, timeout time.Duration) error {
+	if !cfg.WebEnabled {
+		return nil
+	}
+	return web.CheckHealth(cfg.WebAddr, timeout)
 }
 
 // tzUnrecognised reports whether the TZ variable is set to a zone the runtime could not load and

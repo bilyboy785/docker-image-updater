@@ -48,7 +48,7 @@ func TestFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock", "/config", true, 45 * time.Second}
+	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock", "/config", true, 45 * time.Second, false}
 	if c != want {
 		t.Fatalf("got %+v want %+v", c, want)
 	}
@@ -141,5 +141,19 @@ func TestCleanupImagesFlagOverridesEnv(t *testing.T) {
 	c, err := Load([]string{"-cleanup-images=false"}, env(map[string]string{"CLEANUP_IMAGES": "true"}))
 	if err != nil || c.CleanupImages {
 		t.Fatalf("%+v %v", c, err)
+	}
+}
+
+func TestHealthcheckFlag(t *testing.T) {
+	cfg, err := Load([]string{"-healthcheck"}, func(string) string { return "" })
+	if err != nil || !cfg.HealthCheck {
+		t.Fatalf("%+v %v", cfg, err)
+	}
+	cfg, err = Load(nil, func(string) string { return "" })
+	if err != nil || cfg.HealthCheck {
+		t.Fatalf("%+v %v", cfg, err)
+	}
+	if !strings.Contains(Usage(), "-healthcheck") {
+		t.Fatal("the flag must be documented in the usage")
 	}
 }
