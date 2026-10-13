@@ -34,12 +34,15 @@ jobs:
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE }}
-          # `latest` only for stable releases (not for -rc, -beta, ... or pre-releases).
-          flavor: latest=auto
+          # `latest`, `major` and `major.minor` only for stable releases: never for a release marked
+          # as a pre-release on GitHub, nor for a tag with a suffix (-rc.1, -beta, ...).
+          # The exact version tag is always published.
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}},enable=${{ !github.event.release.prerelease }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !github.event.release.prerelease && !contains(github.event.release.tag_name, '-') }}
+            type=semver,pattern={{major}},enable=${{ !github.event.release.prerelease && !contains(github.event.release.tag_name, '-') }}
+            type=raw,value=latest,enable=${{ !github.event.release.prerelease && !contains(github.event.release.tag_name, '-') }}
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
