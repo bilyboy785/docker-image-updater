@@ -246,7 +246,7 @@ Layout:
 - `internal/web`: dashboard and API.
 - `test`: integration test.
 
-To release, push a `v*` tag (for example `v0.1.0`). CI then builds and publishes the multi-arch image to `ghcr.io`.
+Every push to `main` and every pull request runs the unit and integration tests. To release, publish a GitHub release for a `v*` tag (for example `gh release create v1.0.0 --generate-notes`): the Release workflow re-runs the tests, then builds and pushes the multi-arch image to `ghcr.io`. Pre-releases (for example `v1.1.0-rc1`) do not update `latest`.
 
 ## License
 
