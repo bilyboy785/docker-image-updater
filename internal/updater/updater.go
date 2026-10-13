@@ -113,10 +113,13 @@ func (u *Updater) isSelf(c docker.Container) bool {
 // maxDetail is the longest detail text kept in the container list.
 const maxDetail = 200
 
-// trunc cuts s to n characters.
+// maxWindow is the longest window label kept in the container list.
+const maxWindow = 64
+
+// trunc cuts s to at most n characters, the ellipsis that marks the cut included.
 func trunc(s string, n int) string {
 	if r := []rune(s); len(r) > n {
-		return string(r[:n]) + "…"
+		return string(r[:n-1]) + "…"
 	}
 	return s
 }
@@ -142,7 +145,7 @@ func (u *Updater) note(c docker.Container, ref, status, detail string) {
 	u.report[c.Name()] = stats.ContainerStatus{
 		Name: c.Name(), Image: ref, ImageID: shortID(c.ImageID), Status: status,
 		Detail: trunc(strings.Join(strings.Fields(detail), " "), maxDetail),
-		Policy: pol, Window: c.Labels[WindowLabel], CheckedAt: u.now(),
+		Policy: pol, Window: trunc(c.Labels[WindowLabel], maxWindow), CheckedAt: u.now(),
 	}
 }
 
@@ -667,12 +670,13 @@ func (u *Updater) rollback(ctx context.Context, old docker.Container, name, newI
 		}
 	}
 	if err := u.docker.RenameContainer(rctx, old.ID, name); err != nil {
-		return stats.StatusFailed, fmt.Errorf("%w (rollback failed: could not rename the old container back: %v; "+
-			"the service may be DOWN, the stopped old container is named %s_old)", cause, err, name)
+		// The essential information comes first: the container list truncates long details.
+		return stats.StatusFailed, fmt.Errorf("rollback failed, the service may be DOWN; old container is named %s_old "+
+			"(could not rename it back: %v); cause: %w", name, err, cause)
 	}
 	if err := u.docker.StartContainer(rctx, old.ID); err != nil {
-		return stats.StatusFailed, fmt.Errorf("%w (rollback failed: could not restart the old container: %v; "+
-			"the service may be DOWN, the stopped old container is named %s and is the one to start)", cause, err, name)
+		return stats.StatusFailed, fmt.Errorf("rollback failed, the service may be DOWN; old container is named %s and is the one to start "+
+			"(could not restart it: %v); cause: %w", name, err, cause)
 	}
 	return stats.StatusRolledBack, cause
 }

@@ -85,7 +85,7 @@ func TestReportPullAndImageIDFailures(t *testing.T) {
 	_, s := scan(f, false)
 	e := entry(t, s, "a")
 	wantEntry(t, e, stats.ContainerFailed, "xxx")
-	if n := len([]rune(e.Detail)); n > 201 {
+	if n := len([]rune(e.Detail)); n > 200 {
 		t.Fatalf("detail not truncated: %d", n)
 	}
 
@@ -225,5 +225,49 @@ func TestReportListFailureKeepsThePreviousList(t *testing.T) {
 	}
 	if len(s.Snapshot().Containers) != 1 {
 		t.Fatalf("%+v", s.Snapshot().Containers)
+	}
+}
+
+func TestTruncKeepsAtMostNCharactersIncludingTheEllipsis(t *testing.T) {
+	for _, s := range []string{strings.Repeat("x", 500), strings.Repeat("é", 500), strings.Repeat("x", 201), strings.Repeat("x", 200), "short"} {
+		got := trunc(s, 200)
+		if n := len([]rune(got)); n > 200 {
+			t.Fatalf("%d runes for an input of %d", n, len([]rune(s)))
+		}
+		if len([]rune(s)) > 200 && !strings.HasSuffix(got, "…") {
+			t.Fatalf("truncated text must end with an ellipsis: %q", got)
+		}
+		if len([]rune(s)) <= 200 && got != s {
+			t.Fatalf("short text must be kept as is: %q", got)
+		}
+	}
+}
+
+func TestWindowIsTruncatedInTheContainerStatus(t *testing.T) {
+	f := updatable(map[string]string{WindowLabel: strings.Repeat("9", 300)})
+	_, s := scan(f, false)
+	if n := len([]rune(entry(t, s, "a").Window)); n > 64 {
+		t.Fatalf("window not truncated: %d", n)
+	}
+}
+
+func TestFailedRollbackDetailKeepsTheEssentialInformationFirst(t *testing.T) {
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:   map[string]*docker.ContainerInfo{"a": basicInfo("a")},
+		images: map[string]string{"nginx:latest": "sha256:2"},
+		failOn: map[string]error{"StartNew": errors.New(strings.Repeat("c", 500))}}
+	u, _, s := newUpdater(f, false)
+	u.docker = &renameBackFails{f}
+	u.RunOnce(context.Background())
+	e := entry(t, s, "a")
+	if e.Status != stats.ContainerFailed || len([]rune(e.Detail)) > 200 {
+		t.Fatalf("%d %+v", len([]rune(e.Detail)), e)
+	}
+	if !strings.HasPrefix(e.Detail, "rollback failed, the service may be DOWN; old container is named a_old") {
+		t.Fatalf("the essential information must come first: %q", e.Detail)
+	}
+	// The event keeps the whole text.
+	if ev := s.Snapshot().Events[0]; !strings.Contains(ev.Error, strings.Repeat("c", 500)) {
+		t.Fatalf("the event must keep the full cause: %q", ev.Error)
 	}
 }
