@@ -140,3 +140,64 @@ func TestDefaultNetworkModeMapsToBridge(t *testing.T) {
 		t.Fatalf("%v", eps)
 	}
 }
+
+func TestEmptySourceVolumeMountIsPinnedToExistingVolume(t *testing.T) {
+	info := infoFrom(t, `{"Id":"0123456789abcdef","Name":"/x","Config":{"Image":"i"},
+	 "HostConfig":{"NetworkMode":"bridge","Mounts":[{"Type":"volume","Target":"/d"},{"Type":"volume","Source":"v","Target":"/e"}]},
+	 "Mounts":[{"Type":"volume","Name":"abc123","Destination":"/d","RW":true},
+	   {"Type":"volume","Name":"v","Destination":"/e","RW":true}],
+	 "NetworkSettings":{"Networks":{"bridge":{}}}}`)
+	hc := buildCreateSpec(info, "n").Body["HostConfig"].(map[string]any)
+	if _, ok := hc["Binds"]; ok {
+		t.Fatalf("no bind expected: %v", hc["Binds"])
+	}
+	ms := hc["Mounts"].([]any)
+	if ms[0].(map[string]any)["Source"] != "abc123" {
+		t.Fatalf("source not pinned: %v", ms[0])
+	}
+	if ms[1].(map[string]any)["Source"] != "v" {
+		t.Fatalf("named source changed: %v", ms[1])
+	}
+	orig := info.HostConfig["Mounts"].([]any)[0].(map[string]any)
+	if _, ok := orig["Source"]; ok {
+		t.Fatal("input HostConfig.Mounts was mutated")
+	}
+}
+
+func TestContainerNetworkModeDropsHostnameAndPorts(t *testing.T) {
+	info := infoFrom(t, `{"Id":"0123456789abcdef","Name":"/x",
+	 "Config":{"Image":"i","Hostname":"somehost","Domainname":"d","ExposedPorts":{"80/tcp":{}}},
+	 "HostConfig":{"NetworkMode":"container:abc"},"Mounts":[],
+	 "NetworkSettings":{"Networks":{}}}`)
+	spec := buildCreateSpec(info, "n")
+	for _, k := range []string{"Hostname", "Domainname", "ExposedPorts", "NetworkingConfig"} {
+		if _, ok := spec.Body[k]; ok {
+			t.Errorf("%s must be absent", k)
+		}
+	}
+	if len(spec.Extra) != 0 {
+		t.Errorf("extra %+v", spec.Extra)
+	}
+	if _, ok := info.Config["Hostname"]; !ok {
+		t.Error("input mutated")
+	}
+}
+
+func TestBindsAreNotSharedAcrossCalls(t *testing.T) {
+	info := infoFrom(t, `{"Id":"0123456789abcdef","Name":"/x","Config":{"Image":"i"},
+	 "HostConfig":{"NetworkMode":"bridge","Binds":["a:/a:rw"]},
+	 "Mounts":[{"Type":"volume","Name":"anon","Destination":"/d","RW":true}],
+	 "NetworkSettings":{"Networks":{"bridge":{}}}}`)
+	// force spare capacity so a naive append would write into the shared array
+	b := make([]any, 1, 8)
+	b[0] = "a:/a:rw"
+	info.HostConfig["Binds"] = b
+	first := buildCreateSpec(info, "n").Body["HostConfig"].(map[string]any)["Binds"]
+	second := buildCreateSpec(info, "n").Body["HostConfig"].(map[string]any)["Binds"]
+	if !reflect.DeepEqual(first, second) || len(first.([]any)) != 2 {
+		t.Fatalf("%v vs %v", first, second)
+	}
+	if len(info.HostConfig["Binds"].([]any)) != 1 || b[:2][1] != nil {
+		t.Fatal("input binds backing array was written")
+	}
+}

@@ -57,6 +57,12 @@ func buildCreateSpec(info *docker.ContainerInfo, newImageID string) createSpec {
 
 	spec := createSpec{Body: body}
 	mode, _ := hc["NetworkMode"].(string)
+	if strings.HasPrefix(mode, "container:") {
+		// the daemon copies these from the target container; sending them back is rejected
+		delete(body, "Hostname")
+		delete(body, "Domainname")
+		delete(body, "ExposedPorts")
+	}
 	networks := info.NetworkSettings.Networks
 	if mode == "host" || mode == "none" || strings.HasPrefix(mode, "container:") || len(networks) == 0 {
 		return spec
@@ -112,6 +118,7 @@ func cleanEndpoint(ep map[string]any, shortID string) map[string]any {
 func preserveVolumes(info *docker.ContainerInfo, cfg, hc map[string]any) {
 	covered := map[string]bool{}
 	binds, _ := hc["Binds"].([]any)
+	binds = append([]any(nil), binds...) // never write into the input's backing array
 	for _, b := range binds {
 		if s, ok := b.(string); ok {
 			if parts := strings.Split(s, ":"); len(parts) >= 2 {
@@ -120,13 +127,31 @@ func preserveVolumes(info *docker.ContainerInfo, cfg, hc map[string]any) {
 		}
 	}
 	if ms, ok := hc["Mounts"].([]any); ok {
-		for _, m := range ms {
-			if mm := asMap(m); mm != nil {
-				if target, ok := mm["Target"].(string); ok {
-					covered[target] = true
+		cloned := make([]any, len(ms))
+		for i, m := range ms {
+			cloned[i] = m
+			mm := asMap(m)
+			if mm == nil {
+				continue
+			}
+			target, _ := mm["Target"].(string)
+			if target == "" {
+				continue
+			}
+			if src, _ := mm["Source"].(string); src == "" && mm["Type"] == "volume" {
+				// Without a source Docker would create a fresh anonymous volume: pin the existing one.
+				for _, im := range info.Mounts {
+					if im.Type == "volume" && im.Name != "" && im.Destination == target {
+						mm = cloneMap(mm)
+						mm["Source"] = im.Name
+						cloned[i] = mm
+						break
+					}
 				}
 			}
+			covered[target] = true
 		}
+		hc["Mounts"] = cloned
 	}
 	vols := cloneMap(asMap(cfg["Volumes"]))
 	changed := false
