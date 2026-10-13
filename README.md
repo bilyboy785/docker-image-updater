@@ -15,7 +15,8 @@ Keeps your running Docker containers up to date: it pulls fresh images on a sche
 - Periodic check, with the interval set in minutes.
 - Private registry support (GHCR, Docker Hub, self-hosted) through a mounted Docker config file.
 - Telegram notifications (optional).
-- Optional statistics dashboard, with a button to force a scan.
+- Optional statistics dashboard with the status of every container and a button to force a scan.
+- Prometheus metrics (`/metrics`), a liveness endpoint (`/healthz`) and a built-in image `HEALTHCHECK`.
 - Per-container opt-out label, update policy (`auto` or `notify`) and update time windows.
 - Locally built images are ignored silently.
 - Dry-run mode: only notify, never recreate.
@@ -81,6 +82,7 @@ Every setting can be given as an environment variable or as a command-line flag.
 | `CLEANUP_IMAGES`         | `-cleanup-images`  | `false`                 | Remove the previous image after a successful update. See [Cleaning up old images](#cleaning-up-old-images). |
 | `TZ`                     | none               | `UTC`                   | Time zone used to evaluate update windows, for example `Europe/Paris`. The zone database is embedded in the binary. See [Update policy and windows](#update-policy-and-windows). |
 | `DOCKER_CONFIG`          | `-docker-config`   | empty                   | Directory containing a Docker `config.json` with registry credentials. Pulls are anonymous when empty. See [Private registries](#private-registries). |
+| none                     | `-healthcheck`     | off                     | Probe `/healthz` of the local web server and exit (`0` healthy, `1` otherwise), then stop. Used by the image `HEALTHCHECK`; exits `0` at once when the web server is disabled. See [Health endpoint and image healthcheck](#health-endpoint-and-image-healthcheck). |
 
 ## How it works
 
@@ -310,10 +312,65 @@ Set `WEB_ENABLED=true` to start a small web server (address set by `WEB_ADDR`, `
 
 | Route         | Description |
 |---------------|-------------|
-| `/`           | Statistics page. |
-| `/api/stats`  | The same statistics as JSON. |
-| `/healthz`    | Returns `ok`. |
+| `/`           | Statistics page, with the container list. |
+| `/api/stats`  | The same statistics as JSON, including the container list (`containers`). |
+| `/metrics`    | Prometheus metrics (see [Metrics](#metrics)). |
+| `/healthz`    | `200 ok` while the scan loop is alive, `503 stale: ...` otherwise (see [Health endpoint and image healthcheck](#health-endpoint-and-image-healthcheck)). |
 | `POST /api/scan` | Starts an immediate scan (see below). |
+
+### Container list
+
+The **Containers** section of the page, and the `containers` array of `/api/stats`, show what the last scan found about every running container, with one entry per container name. Chips above the table filter by status (click a chip again to clear the filter). The list is rebuilt by each scan and is not saved in the state file, so it is empty until the first scan after a start.
+
+| Status             | Meaning |
+|--------------------|---------|
+| `up-to-date`       | The container runs the image the registry currently serves. |
+| `updated`          | The container was recreated on a newer image by the last scan (the detail shows the old and new image ids, and a health note if any). |
+| `update-available` | A newer image exists but is not applied: `policy: notify`, dry-run, a `--rm` container, or the updater itself (manual update required). |
+| `waiting-window`   | A newer image exists and the update waits for the container's update window. |
+| `failed`           | The image could not be checked (pull or lookup error) or the update failed. The detail holds the error, cut to 200 characters. |
+| `rolled-back`      | The update was rolled back (health gate failure), or the image is not retried because of an earlier gate failure. |
+| `skipped`          | Not checked: opted out, pinned by digest, image reference that cannot be resolved, locally built image, or invalid policy labels. The detail says which. |
+| `self`             | The updater's own container, which is never updated by itself. |
+
+Each entry also carries the image, its short image id, the policy (`auto` or `notify`), the raw window label and the time of the check.
+
+### Metrics
+
+`GET /metrics` serves the counters and gauges below in the Prometheus text format (version 0.0.4). They come from the same data as `/api/stats`; no container name, image or environment is exposed.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `diu_scans_total` | counter | Completed scans (kept across restarts with `STATE_FILE`). |
+| `diu_updates_total` | counter | Containers updated. |
+| `diu_failures_total` | counter | Failed updates and image checks. |
+| `diu_rollbacks_total` | counter | Updates rolled back. |
+| `diu_scanning` | gauge | `1` while a scan runs, else `0`. |
+| `diu_containers_watched` | gauge | Containers checked by the last scan. |
+| `diu_containers_skipped` | gauge | Containers ignored by the last scan. |
+| `diu_last_scan_timestamp_seconds` | gauge | Start of the last scan as a Unix time, `0` when none yet. |
+| `diu_last_scan_duration_seconds` | gauge | Duration of the last scan. |
+| `diu_next_scan_timestamp_seconds` | gauge | Planned time of the next scan, `0` when unknown. |
+| `diu_uptime_seconds` | gauge | Time since the updater started. |
+| `diu_build_info{version,mode}` | gauge | Always `1`; the labels carry the version and the mode (`active` or `dry-run`). |
+| `diu_containers{status}` | gauge | Containers per status of the last scan, for every status above (`0` when none). |
+
+A scrape configuration:
+
+```yaml
+scrape_configs:
+  - job_name: docker-image-updater
+    static_configs:
+      - targets: ["updater-host:8080"]
+```
+
+### Health endpoint and image healthcheck
+
+`/healthz` answers `200` with `ok` while the scan loop is alive and `503` with a short `stale: ...` text when it is not. The reference time is the end of the last scan completed by this process, or the start of the process while none has completed yet. The updater is healthy while `now - reference <= 2 * interval + 35 minutes` (35 minutes cover the 30 minute pull timeout of a slow scan).
+
+The image declares `HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 CMD ["/docker-image-updater","-healthcheck"]`. The `-healthcheck` mode requests `/healthz` on `WEB_ADDR` (`:8080` becomes `127.0.0.1:8080`; a host is kept), with a 3 second timeout, and exits `0` on a `200` and `1` otherwise. When the web server is disabled (`WEB_ENABLED` not true) there is nothing to check and it exits `0` immediately, so `docker ps` shows `healthy` once the container is up. With the web server enabled, `docker ps` shows `(healthy)` after the first probe, one minute after the start.
+
+**`/metrics`, `/api/stats` and the page have no authentication**, like the rest of the dashboard: see the note below.
 
 ### Forcing a scan
 
@@ -330,7 +387,7 @@ The call returns immediately with `202` and `{"status":"started"}`. A forced sca
 - a forced scan is refused with `429` and a `Retry-After` header when the last scan started less than 30 seconds ago (automatic scans are not affected);
 - other methods answer `405`, and the request body is ignored.
 
-**The dashboard has no authentication.** Bind it to `127.0.0.1` (for example `127.0.0.1:8080:8080` in the port mapping) or put it behind a reverse proxy that handles access control. The dashboard is no longer strictly read-only: anyone who can reach it can force a scan. This does nothing the schedule would not do anyway, but there is still no authentication, so keep it on a private network or behind a reverse proxy. The header and `Origin` checks do not protect against DNS rebinding: rely on network isolation and do not expose the port to untrusted networks.
+**The dashboard has no authentication** (neither has `/metrics`, `/api/stats` nor `/healthz`). Bind it to `127.0.0.1` (for example `127.0.0.1:8080:8080` in the port mapping) or put it behind a reverse proxy that handles access control. The dashboard is no longer strictly read-only: anyone who can reach it can force a scan. This does nothing the schedule would not do anyway, but there is still no authentication, so keep it on a private network or behind a reverse proxy. The header and `Origin` checks do not protect against DNS rebinding: rely on network isolation and do not expose the port to untrusted networks.
 
 Behind a reverse proxy, the proxy must forward the original `Host` header, because the `Origin` of the page is compared with it. With nginx add `proxy_set_header Host $host;` (the `proxy_pass` default sends the upstream host); Traefik and Caddy do it by default. Otherwise "Scan now" fails with HTTP 403.
 
