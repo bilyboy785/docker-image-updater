@@ -198,16 +198,29 @@ func TestContainersAreNotPersisted(t *testing.T) {
 	}
 }
 
-func TestContainersJSONKeyIsLast(t *testing.T) {
+func TestContainersIsFollowedOnlyByLastProgress(t *testing.T) {
 	s, _ := New("v", "active", "")
-	s.SetContainers([]ContainerStatus{{Name: "a", Image: "i", ImageID: "abc", Status: ContainerSkipped, Detail: "d", Policy: "auto", Window: "w", CheckedAt: time.Unix(0, 0).UTC()}})
+	s.SetContainers([]ContainerStatus{{Name: "a", Status: ContainerSkipped}})
 	b, _ := json.Marshal(s.Snapshot())
-	want := `"containers":[{"name":"a","image":"i","image_id":"abc","status":"skipped","detail":"d","policy":"auto","window":"w","checked_at":"1970-01-01T00:00:00Z"}],"last_progress":`
-	if !strings.Contains(string(b), want) {
-		t.Fatalf("last_progress must directly follow containers: %s", b)
+	dec := json.NewDecoder(strings.NewReader(string(b)))
+	if tok, _ := dec.Token(); tok != json.Delim('{') {
+		t.Fatalf("not an object: %s", b)
 	}
-	if !strings.HasSuffix(string(b), "Z\"}") {
-		t.Fatalf("last_progress must be the last key: %s", b)
+	var keys []string
+	for dec.More() {
+		k, err := dec.Token()
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, k.(string))
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n := len(keys)
+	if n < 2 || keys[n-2] != "containers" || keys[n-1] != "last_progress" {
+		t.Fatalf("containers must be followed only by last_progress, the last key: %v", keys)
 	}
 }
 
