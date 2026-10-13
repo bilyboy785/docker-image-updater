@@ -140,16 +140,19 @@ Example `config.json`, with an entry for GitHub Container Registry and one for D
 `auth` is the base64 encoding of `username:token`:
 
 ```bash
-echo -n 'username:token' | base64
+printf '%s' 'username:token' | base64 | tr -d '\n'
 ```
 
-Entries may also use explicit `username` and `password` fields, or an `identitytoken`. For GHCR, use a personal access token with the `read:packages` scope. For Docker Hub, use an access token. A self-hosted registry is matched by its host and port, for example `registry.example.com:5000`.
+Typing the token on the command line may leave it in your shell history: clear the history entry or read the token from a file or a password manager instead.
+
+Entries may also use explicit `username` and `password` fields (when `auth` is also present it wins, as with the Docker CLI), or an `identitytoken`. For GHCR, use a personal access token with the `read:packages` scope. For Docker Hub, use an access token. A self-hosted registry is matched by its host and port, for example `registry.example.com:5000`.
 
 Notes:
 
 - Use a token with read-only scope: the updater only pulls.
-- The file contains secrets. Restrict its permissions and mount it read-only, as shown above. The updater never logs the credentials or includes them in notifications.
-- The file is read again on every scan, so a rotated token is picked up without restarting the updater.
+- The file contains secrets. Make it `chmod 600`, owned by the user running the container (root), and mount it read-only, as shown above. The updater never logs the credentials or includes them in notifications.
+- The file is read again on every pull, so a rotated token is picked up without restarting the updater. Mount the directory (not the file itself) and rotate atomically: write a temporary file in the directory, then rename it over `config.json`.
+- The file is limited to 1 MiB.
 - Registry names are matched case-insensitively, and a `https://` prefix or a path in the key is ignored. `docker.io`, `index.docker.io` and `registry-1.docker.io` all designate Docker Hub.
 - Credential helpers and credential stores (`credsStore`, `credHelpers`) are not supported, because the image contains no helper binaries. On macOS and Windows, `docker login` stores the secrets in the OS keychain (`credsStore`), so the generated `~/.docker/config.json` has no usable `auths` entry: create a dedicated minimal file as shown above instead. When a registry is configured with a helper and has no inline entry, the updater logs a warning once and pulls anonymously.
 - If the file is missing or invalid, the updater logs a warning and pulls anonymously.
