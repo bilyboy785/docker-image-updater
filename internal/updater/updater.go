@@ -415,6 +415,13 @@ func (u *Updater) announceAvailable(ctx context.Context, ev stats.Event, c docke
 func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID string, all []docker.Container, cfgs map[string]map[string]any) {
 	ev := stats.Event{Container: c.Name(), Image: ref, OldID: shortID(c.ImageID), NewID: shortID(newID)}
 	self := u.isSelf(c)
+	pol, perr := ParsePolicy(c.Labels)
+	if perr != nil && !self {
+		// Fail closed, also in dry-run: a typo must not be announced as an available update.
+		u.warnBadPolicy(c, perr)
+		u.note(c, ref, stats.ContainerSkipped, "invalid label: "+perr.Error())
+		return
+	}
 	if self || u.dryRun {
 		note := ""
 		if self {
@@ -426,13 +433,6 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 		} else {
 			u.note(c, ref, stats.ContainerUpdateAvailable, "dry-run")
 		}
-		return
-	}
-	pol, perr := ParsePolicy(c.Labels)
-	if perr != nil {
-		// Fail closed: a typo must never turn into an update outside the intended window.
-		u.warnBadPolicy(c, perr)
-		u.note(c, ref, stats.ContainerSkipped, "invalid label: "+perr.Error())
 		return
 	}
 	if pol.Notify {

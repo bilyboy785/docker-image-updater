@@ -298,3 +298,15 @@ func TestFailedRollbackDetailKeepsTheEssentialInformationFirst(t *testing.T) {
 		t.Fatalf("the event must keep the full cause: %q", ev.Error)
 	}
 }
+
+func TestInvalidLabelWinsOverDryRun(t *testing.T) {
+	f := updatable(map[string]string{PolicyLabel: "sometimes"})
+	u, n, s := newUpdater(f, true)
+	u.RunOnce(context.Background())
+	if len(n.msgs) != 0 || len(s.Snapshot().Events) != 0 {
+		t.Fatalf("no notification for an invalid label: %v %+v", n.msgs, s.Snapshot().Events)
+	}
+	if e := entry(t, s, "a"); e.Status != stats.ContainerSkipped || !strings.HasPrefix(e.Detail, "invalid label: ") {
+		t.Fatalf("%+v", e)
+	}
+}
