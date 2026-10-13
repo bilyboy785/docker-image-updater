@@ -82,6 +82,27 @@ func TestPageNeverUsesInnerHTMLForData(t *testing.T) {
 	}
 }
 
+func TestPageHasTheContainerList(t *testing.T) {
+	page := string(indexHTML)
+	for _, want := range []string{
+		`id="containers"`, `id="chips"`, `id="ctable"`, `id="cempty"`, `No containers observed yet`,
+		`>Containers<`, `aria-pressed`, `scope="col"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html lacks %s", want)
+		}
+	}
+	if strings.Index(page, `id="containers"`) > strings.Index(page, "Recent activity") {
+		t.Error("the container list must come above the recent activity")
+	}
+	// Every known status must have an allow-listed class and a pill style.
+	for _, st := range stats.ContainerStatuses {
+		if !strings.Contains(page, "'"+st+"'") || !strings.Contains(page, ".pill.c-"+st) {
+			t.Errorf("status %s is not handled by the page", st)
+		}
+	}
+}
+
 func scanHandler(res ScanResult) (http.Handler, *int) {
 	calls := 0
 	return Handler(testSnap, func() ScanResult { calls++; return res }), &calls

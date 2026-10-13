@@ -41,6 +41,21 @@ td.err{white-space:normal;color:var(--bad);font-size:13px;max-width:320px}
 .pill.failed{color:var(--bad);background:color-mix(in srgb,var(--bad) 14%,transparent)}
 .pill.rolled_back{color:var(--warn);background:color-mix(in srgb,var(--warn) 16%,transparent)}
 .pill.available{color:var(--info);background:color-mix(in srgb,var(--info) 14%,transparent)}
+.pill.c-up-to-date{color:var(--ok);background:color-mix(in srgb,var(--ok) 14%,transparent)}
+.pill.c-updated{color:var(--ok);background:color-mix(in srgb,var(--ok) 22%,transparent)}
+.pill.c-update-available{color:var(--info);background:color-mix(in srgb,var(--info) 14%,transparent)}
+.pill.c-waiting-window{color:var(--warn);background:color-mix(in srgb,var(--warn) 16%,transparent)}
+.pill.c-failed{color:var(--bad);background:color-mix(in srgb,var(--bad) 14%,transparent)}
+.pill.c-rolled-back{color:var(--warn);background:color-mix(in srgb,var(--warn) 22%,transparent)}
+.pill.c-skipped,.pill.c-self,.pill.c-unknown{color:var(--muted);background:var(--panel2);border-color:var(--border)}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+.chip{font:inherit;font-size:13px;padding:3px 12px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--muted);cursor:pointer}
+.chip .n{font-weight:650;color:var(--text);font-variant-numeric:tabular-nums;margin-left:4px}
+.chip[aria-pressed="true"]{border-color:var(--accent);color:var(--text);background:color-mix(in srgb,var(--accent) 16%,transparent)}
+.chip:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+td.detail{white-space:normal;min-width:200px;max-width:340px;font-size:13px;color:var(--muted)}
+td .sub{display:block;color:var(--muted);font-size:12px}
+section+section{margin-top:28px}
 .empty{padding:36px 16px;text-align:center;color:var(--muted)}
 .scan{display:inline-flex;align-items:center;gap:8px}
 .scan button{font:inherit;font-size:13px;font-weight:600;padding:5px 14px;border-radius:999px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer}
@@ -70,6 +85,18 @@ footer{margin-top:22px;color:var(--muted);font-size:13px;text-align:center}
   <div class="card"><div class="label">Next scan</div><div class="value" id="nextscan" style="font-size:22px;padding-top:6px">—</div><div class="sub" id="lastdur">Last scan took —</div></div>
  </div>
 
+ <section id="containers" aria-labelledby="ctitle">
+  <h2 id="ctitle">Containers</h2>
+  <div class="chips" id="chips" role="group" aria-label="Filter containers by status"></div>
+  <div class="table"><div class="scroll">
+   <table id="ctable">
+    <thead><tr><th scope="col">Container</th><th scope="col">Image</th><th scope="col">Status</th><th scope="col">Detail</th><th scope="col">Policy / window</th><th scope="col">Last checked</th></tr></thead>
+    <tbody id="cbody"></tbody>
+   </table>
+  </div>
+  <div class="empty" id="cempty" hidden>No containers observed yet</div></div>
+ </section>
+
  <section>
   <h2>Recent activity</h2>
   <div class="table"><div class="scroll">
@@ -84,6 +111,10 @@ footer{margin-top:22px;color:var(--muted);font-size:13px;text-align:center}
 </main>
 <script>
 const STATUSES = ['updated', 'failed', 'rolled_back', 'available'];
+// Allow-list of container statuses: only these become CSS classes, anything else is a neutral pill.
+const CSTATUSES = ['up-to-date', 'updated', 'update-available', 'waiting-window', 'failed', 'rolled-back', 'skipped', 'self'];
+const CLABELS = {'up-to-date': 'Up to date', 'updated': 'Updated', 'update-available': 'Update available', 'waiting-window': 'Waiting for window', 'failed': 'Failed', 'rolled-back': 'Rolled back', 'skipped': 'Skipped', 'self': 'Self'};
+let filter = '', containers = [];
 const $ = id => document.getElementById(id);
 const valid = s => { const d = new Date(s); return isNaN(d) || d.getFullYear() < 2000 ? null : d; };
 const when = s => { const d = valid(s); return d ? d.toLocaleString() : '—'; };
@@ -106,7 +137,53 @@ const uptime = s => {
 };
 const cell = (tr, text, cls) => { const td = document.createElement('td'); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); return td; };
 
+const chips = {};
+function buildChips() {
+  for (const key of [''].concat(CSTATUSES)) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'chip';
+    b.appendChild(document.createElement('span'));
+    const n = document.createElement('span'); n.className = 'n'; b.appendChild(n);
+    b.firstChild.textContent = key ? CLABELS[key] : 'All';
+    b.addEventListener('click', () => { filter = key && filter !== key ? key : ''; renderContainers(); });
+    $('chips').appendChild(b);
+    chips[key] = b;
+  }
+}
+function renderContainers() {
+  const counts = {'': containers.length};
+  for (const c of containers) counts[c.status] = (counts[c.status] || 0) + 1;
+  for (const key in chips) {
+    const b = chips[key];
+    b.lastChild.textContent = counts[key] || 0;
+    b.hidden = key !== '' && key !== filter && !counts[key];
+    b.setAttribute('aria-pressed', String(key === filter));
+  }
+  const body = $('cbody');
+  body.replaceChildren();
+  const shown = filter ? containers.filter(c => c.status === filter) : containers;
+  $('cempty').hidden = shown.length > 0;
+  $('cempty').textContent = containers.length ? 'No containers match this filter' : 'No containers observed yet';
+  for (const c of shown) {
+    const tr = document.createElement('tr');
+    cell(tr, c.name, 'mono');
+    const img = cell(tr, c.image, 'mono');
+    if (c.image_id) { const id = document.createElement('span'); id.className = 'sub'; id.textContent = c.image_id; img.appendChild(id); }
+    const pill = document.createElement('span');
+    const st = typeof c.status === 'string' ? c.status : '';
+    pill.className = CSTATUSES.includes(st) ? 'pill c-' + st : 'pill c-unknown';
+    pill.textContent = CLABELS[st] || st || 'unknown';
+    cell(tr, '').appendChild(pill);
+    cell(tr, c.detail || '', 'detail');
+    cell(tr, (c.policy || '') + (c.window ? ' · ' + c.window : ''));
+    cell(tr, rel(c.checked_at));
+    body.appendChild(tr);
+  }
+}
+
 function render(s) {
+  containers = Array.isArray(s.containers) ? s.containers : [];
+  renderContainers();
   $('version').textContent = s.version;
   $('mode').textContent = s.mode;
   $('scans').textContent = s.scans;
@@ -196,6 +273,7 @@ async function scanNow() {
   refresh();
 }
 $('scan').addEventListener('click', scanNow);
+buildChips();
 refresh();
 </script>
 </body>
