@@ -76,11 +76,10 @@ if [ -z "$DIND_ID" ] || [ "$DIND_ID" == "$HOST_ID" ] || docker ps -a --format '{
 fi
 DIND_VERIFIED=1
 
-# The CLI used by this script gets its own, empty, config directory: it never reads or writes the
-# developer's ~/.docker. CLI plugins (compose) are linked from there when present.
-export DOCKER_CONFIG="$WORK/cli-config"
-mkdir -p "$DOCKER_CONFIG"
-[ -d "$HOME/.docker/cli-plugins" ] && ln -s "$HOME/.docker/cli-plugins" "$DOCKER_CONFIG/cli-plugins"
+# The registry credentials are only ever used by the docker client running INSIDE the dind
+# container (see dind_login and build_push). The host docker CLI never receives them, so nothing
+# can end up in the developer's credential store, and DOCKER_CONFIG is never changed.
+export REG_USER REG_PASS
 
 echo "==> loading the updater image into dind"
 env -u DOCKER_HOST docker save "$IMAGE" | docker load >/dev/null
@@ -97,7 +96,13 @@ RUN echo "\$VERSION" > /version
 CMD ["sh", "-c", "trap 'exit 0' TERM; : app-v$1; while :; do sleep 1; done"]
 EOF
   docker build -q --build-arg VERSION="$1" -t "$REF" "$WORK/img" >/dev/null
-  docker push -q "$REF" >/dev/null
+  # Push from inside the dind container: its own client has its own config, no credential helper.
+  HOST_DOCKER exec -e REF diu-dind docker push -q "$REF" >/dev/null
+}
+
+dind_login() {
+  HOST_DOCKER exec -i -e REG_USER -e REG_PASS diu-dind \
+    sh -c 'printf "%s" "$REG_PASS" | docker login "localhost:'"${REG_PORT}"'" -u "$REG_USER" --password-stdin' >/dev/null
 }
 
 cat > "$WORK/compose.yml" <<'EOF'
@@ -127,7 +132,7 @@ for _ in $(seq 1 30); do curl -sf -m 3 -u "$REG_USER:$REG_PASS" "http://127.0.0.
 [ "${reg_ok:-0}" == 1 ] || { echo "registry did not become ready"; exit 1; }
 REG_ANON_CODE="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${REG_PORT}/v2/")"
 [ "$REG_ANON_CODE" == 401 ] || { echo "registry accepts anonymous requests (HTTP $REG_ANON_CODE)"; exit 1; }
-printf '%s' "$REG_PASS" | docker login "localhost:${REG_PORT}" -u "$REG_USER" --password-stdin >/dev/null
+dind_login
 REG_ID="$(docker inspect -f '{{.Id}} {{.State.StartedAt}}' diu-registry)"
 
 echo "==> publishing image v1 and starting workloads"
@@ -215,6 +220,8 @@ assert_eq "healthz" "ok" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/healthz"
 
 assert_contains "registry credentials enabled at startup" "registry credentials enabled" "$(docker logs diu-updater 2>&1)"
 assert_eq "updater logs never contain the registry password" "0" "$(docker logs diu-updater 2>&1 | grep -c -F "$REG_PASS" || true)"
+REG_AUTH_B64="$(printf '%s:%s' "$REG_USER" "$REG_PASS" | base64 | tr -d '\n')"
+assert_eq "updater logs never contain the base64 auth value" "0" "$(docker logs diu-updater 2>&1 | grep -c -F "$REG_AUTH_B64" || true)"
 assert_eq "stats API never contains the registry password" "0" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -c -F "$REG_PASS" || true)"
 
 echo "==> negative check: an updater without credentials cannot pull from the private registry"
@@ -235,6 +242,7 @@ AFTER="$(for c in diu-run diu-anonv diu-anonm "$COMPOSE_NEW" "$CUSTOM_NEW"; do d
 assert_eq "no container was changed by the updater without credentials" "$BEFORE" "$AFTER"
 assert_eq "no leftover _old container after the negative check" "0" "$(docker ps -a --format '{{.Names}}' | grep -c '_old$' || true)"
 assert_eq "no-credentials updater logs never contain the registry password" "0" "$(docker logs diu-updater-noauth 2>&1 | grep -c -F "$REG_PASS" || true)"
+assert_eq "no-credentials updater logs never contain the base64 auth value" "0" "$(docker logs diu-updater-noauth 2>&1 | grep -c -F "$REG_AUTH_B64" || true)"
 docker rm -f -v diu-updater-noauth >/dev/null
 
 if [ "$FAILS" -ne 0 ]; then echo "$FAILS assertion(s) failed"; docker logs diu-updater; exit 1; fi
