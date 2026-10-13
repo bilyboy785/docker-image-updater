@@ -217,7 +217,8 @@ echo "==> publishing the health gate and cleanup scenario images (v1) and starti
 CRASH_REF="localhost:${REG_PORT}/diu-crash:latest"
 UNHEALTHY_REF="localhost:${REG_PORT}/diu-unhealthy:latest"
 CLEAN_REF="localhost:${REG_PORT}/diu-clean:latest"
-for pair in "diu-crash:$CRASH_REF" "diu-unhealthy:$UNHEALTHY_REF" "diu-clean:$CLEAN_REF"; do
+PLAIN_REF="localhost:${REG_PORT}/diu-plain:latest"
+for pair in "diu-crash:$CRASH_REF" "diu-unhealthy:$UNHEALTHY_REF" "diu-clean:$CLEAN_REF" "diu-plain:$PLAIN_REF"; do
   name="${pair%%:*}"; ref="${pair#*:}"
   publish_image "$ref" 1 "$HC_OK"
   docker run -d --name "$name" "$ref" >/dev/null
@@ -228,6 +229,8 @@ UNHEALTHY_CID="$(docker inspect -f '{{.Id}}' diu-unhealthy)"
 UNHEALTHY_OLD="$(docker inspect -f '{{.Image}}' diu-unhealthy)"
 CLEAN_CID="$(docker inspect -f '{{.Id}}' diu-clean)"
 CLEAN_OLD="$(docker inspect -f '{{.Image}}' diu-clean)"
+PLAIN_CID="$(docker inspect -f '{{.Id}}' diu-plain)"
+PLAIN_OLD="$(docker inspect -f '{{.Image}}' diu-plain)"
 
 echo "==> publishing image v2"
 docker tag "$REF" diu-keep:v1
@@ -242,6 +245,9 @@ assert_eq "the local tag points at v1 again" "$OLD" "$(docker image inspect -f '
 publish_v2_over_v1 "$CRASH_REF" "" 'CMD ["sh", "-c", "exit 3"]'
 publish_v2_over_v1 "$UNHEALTHY_REF" 'HEALTHCHECK --interval=1s --retries=1 CMD false'
 publish_v2_over_v1 "$CLEAN_REF" "$HC_OK"
+# v2 without any healthcheck and with a clean long-running command: the "no healthcheck, stable
+# for 10 seconds" path of the gate.
+publish_v2_over_v1 "$PLAIN_REF"
 assert_eq "the crash image tag points at v1 again" "$CRASH_OLD" "$(docker image inspect -f '{{.Id}}' "$CRASH_REF")"
 assert_eq "the unhealthy image tag points at v1 again" "$UNHEALTHY_OLD" "$(docker image inspect -f '{{.Id}}' "$UNHEALTHY_REF")"
 assert_eq "the clean image tag points at v1 again" "$CLEAN_OLD" "$(docker image inspect -f '{{.Id}}' "$CLEAN_REF")"
@@ -274,8 +280,8 @@ done
 if [ "$ok" != 1 ]; then echo "timeout waiting for the first scan"; docker logs diu-updater; exit 1; fi
 
 echo "==> assertions"
-# 5 containers of the standard image and diu-clean are updated; diu-crash and diu-unhealthy are rolled back.
-assert_eq "updates count (5 standard containers + diu-clean)" "6" "$(stat updates)"
+# 5 containers of the standard image, diu-clean and diu-plain are updated; diu-crash and diu-unhealthy are rolled back.
+assert_eq "updates count (5 standard containers + diu-clean + diu-plain)" "7" "$(stat updates)"
 assert_eq "rollbacks count (diu-crash, diu-unhealthy)" "2" "$(stat rollbacks)"
 assert_eq "failures count" "0" "$(stat failures)"
 STATS1="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
@@ -297,11 +303,22 @@ assert_eq "diu-unhealthy still runs the v1 image" "$UNHEALTHY_OLD" "$(docker ins
 assert_eq "diu-unhealthy has a single container left (no leftover new one)" "1" "$(docker ps -a --filter name=diu-unhealthy --format '{{.Names}}' | wc -l | tr -d ' ')"
 assert_match "diu-unhealthy event is rolled_back" '"container":"diu-unhealthy","image":"[^"]*","old_id":"[^"]*","new_id":"[^"]*","status":"rolled_back","error":"new container failed health gate: [^"]*unhealthy' "$STATS1"
 
+echo "==> health gate: a new container without healthcheck that stays up is kept"
+PLAIN_NEW="$(docker image inspect -f '{{.Id}}' "$PLAIN_REF")"
+assert_eq "diu-plain uses the new image" "$PLAIN_NEW" "$(docker inspect -f '{{.Image}}' diu-plain)"
+assert_eq "diu-plain was recreated" "1" "$([ "$PLAIN_CID" != "$(docker inspect -f '{{.Id}}' diu-plain)" ] && echo 1 || echo 0)"
+assert_eq "diu-plain is running" "true" "$(docker inspect -f '{{.State.Running}}' diu-plain)"
+assert_eq "diu-plain has no healthcheck" "no" "$(docker inspect -f '{{if .State.Health}}yes{{else}}no{{end}}' diu-plain)"
+assert_eq "diu-plain new version is running" "2" "$(docker exec diu-plain cat /version)"
+assert_match "diu-plain event is updated" '"container":"diu-plain","image":"[^"]*","old_id":"[^"]*","new_id":"[^"]*","status":"updated"' "$STATS1"
+
 echo "==> cleanup of the old image"
 CLEAN_NEW="$(docker image inspect -f '{{.Id}}' "$CLEAN_REF")"
 assert_eq "diu-clean uses the new image" "$CLEAN_NEW" "$(docker inspect -f '{{.Image}}' diu-clean)"
 assert_eq "diu-clean was recreated" "1" "$([ "$CLEAN_CID" != "$(docker inspect -f '{{.Id}}' diu-clean)" ] && echo 1 || echo 0)"
 assert_eq "the old v1 image of diu-clean was removed" "gone" "$(docker image inspect "$CLEAN_OLD" >/dev/null 2>&1 && echo present || echo gone)"
+UPDATER_LOGS1="$(docker logs diu-updater 2>&1)"
+assert_eq "the updater logged exactly one removal of the old diu-clean image" "1" "$(grep -c 'msg="removed old image" container=diu-clean ' <<< "$UPDATER_LOGS1" || true)"
 assert_eq "the shared v1 image still used by other containers was kept" "present" "$(docker image inspect "$OLD" >/dev/null 2>&1 && echo present || echo gone)"
 assert_eq "the v1 images of the rolled back containers were kept" "present" "$(docker image inspect "$CRASH_OLD" "$UNHEALTHY_OLD" >/dev/null 2>&1 && echo present || echo gone)"
 COMPOSE_NEW="$(id_of diu-compose)"
@@ -386,6 +403,14 @@ for pair in "diu-local:$LOCAL_CID:$LOCAL_IMG" "diu-notify:$NOTIFY_CID:$OLD" "diu
   assert_eq "$name keeps its container id after the forced scan" "$cid" "$(docker inspect -f '{{.Id}}' "$name")"
   assert_eq "$name keeps its image after the forced scan" "$img" "$(docker inspect -f '{{.Image}}' "$name")"
 done
+# A defective image is not retried: the forced scan neither recreates nor rolls back again.
+assert_eq "rollbacks stay at 2 after the forced scan" "2" "$(stat rollbacks)"
+assert_eq "updates stay at 7 after the forced scan" "7" "$(stat updates)"
+assert_eq "diu-crash keeps its container id after the forced scan" "$CRASH_CID" "$(docker inspect -f '{{.Id}}' diu-crash)"
+assert_eq "diu-crash still runs v1 after the forced scan" "$CRASH_OLD" "$(docker inspect -f '{{.Image}}' diu-crash)"
+assert_eq "diu-unhealthy keeps its container id after the forced scan" "$UNHEALTHY_CID" "$(docker inspect -f '{{.Id}}' diu-unhealthy)"
+assert_eq "diu-unhealthy still runs v1 after the forced scan" "$UNHEALTHY_OLD" "$(docker inspect -f '{{.Image}}' diu-unhealthy)"
+assert_eq "the updater skipped both known bad images" "2" "$(docker logs diu-updater 2>&1 | grep -c 'skipping image that previously failed the health gate' || true)"
 assert_eq "diu-notify has exactly one event" "1" "$(grep -o '"container":"diu-notify"' <<< "$STATS2" | wc -l | tr -d ' ')"
 assert_contains "the notify event has the available status" '"status":"available"' "$STATS2"
 assert_eq "diu-window has no event after the forced scan" "0" "$(grep -c 'diu-window' <<< "$STATS2" || true)"
