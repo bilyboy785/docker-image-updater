@@ -153,6 +153,18 @@ func (c *Client) ImageID(ctx context.Context, ref string) (string, error) {
 	return out.ID, nil
 }
 
+// ImageRepoDigests returns the registry digests of a local image (its RepoDigests). The list is
+// empty for an image that never came from a registry: built locally or loaded from an archive.
+func (c *Client) ImageRepoDigests(ctx context.Context, id string) ([]string, error) {
+	var out struct {
+		RepoDigests []string
+	}
+	if err := c.do(ctx, "GET", "/images/"+id+"/json", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.RepoDigests, nil
+}
+
 // CreateContainer creates a container from a full create payload and returns its ID.
 func (c *Client) CreateContainer(ctx context.Context, name string, body map[string]any) (string, error) {
 	var out struct {

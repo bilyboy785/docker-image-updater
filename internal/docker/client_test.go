@@ -114,6 +114,31 @@ func TestImageID(t *testing.T) {
 	}
 }
 
+func TestImageRepoDigests(t *testing.T) {
+	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/images/sha256:aaa/json":
+			w.Write([]byte(`{"Id":"sha256:aaa","RepoDigests":["app@sha256:111"]}`))
+		case "/images/sha256:bbb/json":
+			w.Write([]byte(`{"Id":"sha256:bbb","RepoDigests":null}`))
+		default:
+			http.Error(w, "no such image", http.StatusNotFound)
+		}
+	})
+	d, err := c.ImageRepoDigests(context.Background(), "sha256:aaa")
+	if err != nil || len(d) != 1 || d[0] != "app@sha256:111" {
+		t.Fatalf("%v %v", d, err)
+	}
+	d, err = c.ImageRepoDigests(context.Background(), "sha256:bbb")
+	if err != nil || len(d) != 0 {
+		t.Fatalf("%v %v", d, err)
+	}
+	var apiErr *APIError
+	if _, err = c.ImageRepoDigests(context.Background(), "sha256:ccc"); !errors.As(err, &apiErr) || apiErr.Status != 404 {
+		t.Fatalf("got %v", err)
+	}
+}
+
 func TestCreateContainer(t *testing.T) {
 	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/containers/create" || r.URL.Query().Get("name") != "web" {
