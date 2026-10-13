@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -102,8 +103,14 @@ func main() {
 // where every failure, a misconfigured probe included, must read as "unhealthy" (exit 1).
 func configErrorExitCode(args []string) int {
 	for _, a := range args {
-		switch a {
-		case "-healthcheck", "--healthcheck", "-healthcheck=true", "--healthcheck=true":
+		name, value, hasValue := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if len(a)-len(strings.TrimLeft(a, "-")) > 2 || name != "healthcheck" || !strings.HasPrefix(a, "-") {
+			continue
+		}
+		if !hasValue {
+			return 1
+		}
+		if on, err := strconv.ParseBool(value); err == nil && on {
 			return 1
 		}
 	}

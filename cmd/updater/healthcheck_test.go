@@ -45,6 +45,16 @@ func TestConfigErrorExitCode(t *testing.T) {
 		{[]string{"--healthcheck"}, 1},
 		{[]string{"-interval", "0", "-healthcheck=true"}, 1},
 		{[]string{"-healthcheck=false", "-interval", "0"}, 2},
+		{[]string{"-healthcheck=1"}, 1},
+		{[]string{"-healthcheck=t"}, 1},
+		{[]string{"-healthcheck=T"}, 1},
+		{[]string{"--healthcheck=TRUE"}, 1},
+		{[]string{"-healthcheck=True"}, 1},
+		{[]string{"--healthcheck=true"}, 1},
+		{[]string{"-healthcheck=0"}, 2},
+		{[]string{"-healthcheck=maybe"}, 2},
+		{[]string{"---healthcheck"}, 2},
+		{[]string{"healthcheck"}, 2},
 	} {
 		if got := configErrorExitCode(tc.args); got != tc.want {
 			t.Errorf("%v: got %d want %d", tc.args, got, tc.want)
