@@ -55,8 +55,12 @@ func TestAPIStats(t *testing.T) {
 }
 
 func TestHealthz(t *testing.T) {
-	if rec := get(t, "/healthz"); rec.Code != 200 || rec.Body.String() != "ok" {
+	rec := get(t, "/healthz")
+	if rec.Code != 200 || rec.Body.String() != "ok" {
 		t.Fatalf("%d %q", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Fatalf("content type %q", ct)
 	}
 }
 

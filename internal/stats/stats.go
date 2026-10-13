@@ -12,6 +12,7 @@ import (
 	"time"
 )
 
+// Event statuses.
 const (
 	StatusUpdated    = "updated"
 	StatusFailed     = "failed"
@@ -21,6 +22,7 @@ const (
 	maxEvents = 50
 )
 
+// Event is one entry of the activity history.
 type Event struct {
 	Time      time.Time `json:"time"`
 	Container string    `json:"container"`
@@ -31,6 +33,7 @@ type Event struct {
 	Error     string    `json:"error,omitempty"`
 }
 
+// Snapshot is a copy of the counters and recent events at a point in time.
 type Snapshot struct {
 	Version    string    `json:"version"`
 	Mode       string    `json:"mode"`
@@ -47,6 +50,7 @@ type Snapshot struct {
 	Events     []Event   `json:"events"`
 }
 
+// Stats is a concurrency-safe store of counters and recent events, optionally persisted to a file.
 type Stats struct {
 	mu   sync.Mutex
 	snap Snapshot
@@ -78,6 +82,7 @@ func New(version, mode, path string) (*Stats, error) {
 	return s, nil
 }
 
+// RecordScan records a finished scan: its start, duration and the number of watched and skipped containers.
 func (s *Stats) RecordScan(start time.Time, d time.Duration, watched, skipped int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -88,12 +93,14 @@ func (s *Stats) RecordScan(start time.Time, d time.Duration, watched, skipped in
 	s.saveLocked()
 }
 
+// SetNextScan sets the time of the next planned scan.
 func (s *Stats) SetNextScan(t time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.snap.NextScan = t
 }
 
+// RecordEvent adds an event to the history (newest first, bounded) and updates the counters.
 func (s *Stats) RecordEvent(e Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -115,6 +122,7 @@ func (s *Stats) RecordEvent(e Event) {
 	s.saveLocked()
 }
 
+// Snapshot returns a copy of the current state.
 func (s *Stats) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -132,7 +140,9 @@ func (s *Stats) saveLocked() {
 	if err == nil {
 		tmp := filepath.Join(filepath.Dir(s.path), "."+filepath.Base(s.path)+".tmp")
 		if err = os.WriteFile(tmp, b, 0o600); err == nil {
-			err = os.Rename(tmp, s.path)
+			if err = os.Rename(tmp, s.path); err != nil {
+				_ = os.Remove(tmp)
+			}
 		}
 	}
 	if err != nil {

@@ -13,6 +13,7 @@ import (
 	"time"
 )
 
+// Notifier delivers a notification message.
 type Notifier interface {
 	// Notify sends a message formatted with Telegram's HTML subset.
 	Notify(ctx context.Context, text string) error
@@ -21,22 +22,27 @@ type Notifier interface {
 // Nop is used when Telegram is not configured.
 type Nop struct{}
 
+// Notify does nothing.
 func (Nop) Notify(context.Context, string) error { return nil }
 
+// Telegram sends notifications through the Telegram Bot API.
 type Telegram struct {
 	token, chat, base string
 	hc                *http.Client
 }
 
+// NewTelegram returns a notifier sending to the given chat with the given bot token.
 func NewTelegram(token, chat string) *Telegram {
 	return &Telegram{token: token, chat: chat, base: "https://api.telegram.org", hc: &http.Client{Timeout: 15 * time.Second}}
 }
 
+// WithBaseURL overrides the API base URL (used by tests) and returns t.
 func (t *Telegram) WithBaseURL(u string) *Telegram {
 	t.base = strings.TrimRight(u, "/")
 	return t
 }
 
+// Notify sends text as an HTML message. Errors never contain the bot token.
 func (t *Telegram) Notify(ctx context.Context, text string) error {
 	body, _ := json.Marshal(map[string]any{
 		"chat_id":                  t.chat,

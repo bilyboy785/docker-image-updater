@@ -17,6 +17,7 @@ var indexHTML []byte
 
 const csp = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"
 
+// Handler returns the HTTP handler serving the page (/), the JSON statistics (/api/stats) and /healthz.
 func Handler(snap func() stats.Snapshot) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +33,7 @@ func Handler(snap func() stats.Snapshot) http.Handler {
 		_ = json.NewEncoder(w).Encode(snap())
 	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte("ok"))
 	})
 	return mux
@@ -39,7 +41,7 @@ func Handler(snap func() stats.Snapshot) http.Handler {
 
 // Serve blocks until ctx is cancelled, then shuts the server down gracefully.
 func Serve(ctx context.Context, addr string, h http.Handler) error {
-	srv := &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
 	select {

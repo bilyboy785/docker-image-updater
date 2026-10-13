@@ -88,3 +88,17 @@ func TestJSONKeys(t *testing.T) {
 		t.Fatalf("unexpected JSON layout: %s", b)
 	}
 }
+
+func TestFailedRenameRemovesTempFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "state.json")
+	if err := os.Mkdir(target, 0o700); err != nil { // renaming a file over a directory fails
+		t.Fatal(err)
+	}
+	s, _ := New("v", "active", target)
+	s.RecordScan(time.Now(), time.Millisecond, 1, 0)
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("temp file left behind: %v", entries)
+	}
+}

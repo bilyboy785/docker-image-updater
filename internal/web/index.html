@@ -19,6 +19,7 @@ h1{margin:0;font-size:22px;letter-spacing:-.01em;display:flex;align-items:center
 .live{display:inline-flex;align-items:center;gap:6px}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 60%,transparent);animation:pulse 2s infinite}
 .dot.off{background:var(--bad);animation:none}
+@media (prefers-reduced-motion:reduce){.dot{animation:none}}
 @keyframes pulse{70%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
 .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));margin-bottom:28px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
@@ -76,6 +77,7 @@ footer{margin-top:22px;color:var(--muted);font-size:13px;text-align:center}
  <footer id="uptime">—</footer>
 </main>
 <script>
+const STATUSES = ['updated', 'failed', 'rolled_back', 'available'];
 const $ = id => document.getElementById(id);
 const valid = s => { const d = new Date(s); return isNaN(d) || d.getFullYear() < 2000 ? null : d; };
 const when = s => { const d = valid(s); return d ? d.toLocaleString() : '—'; };
@@ -122,7 +124,9 @@ function render(s) {
     cell(tr, e.image, 'mono');
     cell(tr, e.old_id + ' → ' + e.new_id, 'mono');
     const pill = document.createElement('span');
-    pill.className = 'pill ' + e.status; pill.textContent = e.status.replace('_', ' ');
+    const st = typeof e.status === 'string' ? e.status : '';
+    pill.className = STATUSES.includes(st) ? 'pill ' + st : 'pill';
+    pill.textContent = st.replace('_', ' ');
     cell(tr, '').appendChild(pill);
     cell(tr, e.error || '', 'err');
     body.appendChild(tr);
