@@ -10,15 +10,16 @@ import (
 	"time"
 )
 
+// Config is the validated updater configuration.
 type Config struct {
-	Interval      time.Duration
-	TelegramToken string
-	TelegramChat  string
-	DryRun        bool
-	WebEnabled    bool
-	WebAddr       string
-	StateFile     string
-	Socket        string
+	Interval      time.Duration // time between two scans
+	TelegramToken string        // Telegram bot token; empty disables notifications
+	TelegramChat  string        // Telegram chat ID
+	DryRun        bool          // only notify, never recreate containers
+	WebEnabled    bool          // serve the statistics page
+	WebAddr       string        // listen address of the web server
+	StateFile     string        // statistics persistence file; empty disables persistence
+	Socket        string        // Docker socket path
 }
 
 func envOr(getenv func(string) string, key, def string) string {
@@ -28,25 +29,52 @@ func envOr(getenv func(string) string, key, def string) string {
 	return def
 }
 
-// Load builds the configuration. Environment variables provide defaults, flags override them.
-func Load(args []string, getenv func(string) string) (Config, error) {
+// maxIntervalMinutes caps the check interval at one year.
+const maxIntervalMinutes = 525600
+
+// flags holds the parsed values of every setting, before validation.
+type flags struct {
+	interval, token, chat, dry, web, addr, state, sock *string
+}
+
+// newFlagSet declares every flag. Environment variables provide the defaults.
+func newFlagSet(getenv func(string) string) (*flag.FlagSet, flags) {
 	fs := flag.NewFlagSet("docker-image-updater", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	interval := fs.String("interval", envOr(getenv, "CHECK_INTERVAL_MINUTES", "60"), "check interval in minutes")
-	token := fs.String("telegram-token", getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token")
-	chat := fs.String("telegram-chat", getenv("TELEGRAM_CHAT_ID"), "Telegram chat ID")
-	dry := fs.String("dry-run", envOr(getenv, "DRY_RUN", "false"), "only notify, never recreate containers")
-	web := fs.String("web", envOr(getenv, "WEB_ENABLED", "false"), "enable the stats web server")
-	addr := fs.String("web-addr", envOr(getenv, "WEB_ADDR", ":8080"), "web server listen address")
-	state := fs.String("state-file", getenv("STATE_FILE"), "file used to persist statistics")
-	sock := fs.String("socket", envOr(getenv, "DOCKER_SOCKET", "/var/run/docker.sock"), "Docker socket path")
+	return fs, flags{
+		interval: fs.String("interval", envOr(getenv, "CHECK_INTERVAL_MINUTES", "60"), "check interval in minutes, 1 to 525600 (env CHECK_INTERVAL_MINUTES)"),
+		token:    fs.String("telegram-token", getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token (env TELEGRAM_BOT_TOKEN)"),
+		chat:     fs.String("telegram-chat", getenv("TELEGRAM_CHAT_ID"), "Telegram chat ID (env TELEGRAM_CHAT_ID)"),
+		dry:      fs.String("dry-run", envOr(getenv, "DRY_RUN", "false"), "only notify, never recreate containers (env DRY_RUN)"),
+		web:      fs.String("web", envOr(getenv, "WEB_ENABLED", "false"), "enable the stats web server (env WEB_ENABLED)"),
+		addr:     fs.String("web-addr", envOr(getenv, "WEB_ADDR", ":8080"), "web server listen address (env WEB_ADDR)"),
+		state:    fs.String("state-file", getenv("STATE_FILE"), "file used to persist statistics (env STATE_FILE)"),
+		sock:     fs.String("socket", envOr(getenv, "DOCKER_SOCKET", "/var/run/docker.sock"), "Docker socket path (env DOCKER_SOCKET)"),
+	}
+}
+
+// Usage returns the help text: every flag with its environment variable and default value.
+func Usage() string {
+	fs, _ := newFlagSet(func(string) string { return "" })
+	var b strings.Builder
+	b.WriteString("Usage: docker-image-updater [flags]\n\nFlags override environment variables.\n\n")
+	fs.SetOutput(&b)
+	fs.PrintDefaults()
+	return b.String()
+}
+
+// Load builds the configuration. Environment variables provide defaults, flags override them.
+// It returns flag.ErrHelp (possibly wrapped) when help was requested.
+func Load(args []string, getenv func(string) string) (Config, error) {
+	fs, f := newFlagSet(getenv)
+	interval, token, chat, dry, web, addr, state, sock := f.interval, f.token, f.chat, f.dry, f.web, f.addr, f.state, f.sock
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
 
 	minutes, err := strconv.Atoi(strings.TrimSpace(*interval))
-	if err != nil || minutes < 1 {
-		return Config{}, fmt.Errorf("invalid check interval %q: must be an integer >= 1 (minutes)", *interval)
+	if err != nil || minutes < 1 || minutes > maxIntervalMinutes {
+		return Config{}, fmt.Errorf("invalid check interval %q: must be an integer between 1 and %d (minutes)", *interval, maxIntervalMinutes)
 	}
 	dryRun, err := strconv.ParseBool(*dry)
 	if err != nil {

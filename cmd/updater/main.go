@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,6 +23,10 @@ var version = "dev"
 
 func main() {
 	cfg, err := config.Load(os.Args[1:], os.Getenv)
+	if errors.Is(err, flag.ErrHelp) {
+		fmt.Print(config.Usage())
+		return
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "configuration error:", err)
 		os.Exit(2)

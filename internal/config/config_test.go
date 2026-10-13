@@ -1,6 +1,9 @@
 package config
 
 import (
+	"errors"
+	"flag"
+	"strings"
 	"testing"
 	"time"
 )
@@ -69,5 +72,35 @@ func TestInvalid(t *testing.T) {
 	}
 	if _, err := Load([]string{"-nope"}, env(nil)); err == nil {
 		t.Error("unknown flag: expected error")
+	}
+}
+
+func TestHelpRequested(t *testing.T) {
+	for _, arg := range []string{"-h", "-help", "--help"} {
+		if _, err := Load([]string{arg}, env(nil)); !errors.Is(err, flag.ErrHelp) {
+			t.Errorf("%s: expected flag.ErrHelp, got %v", arg, err)
+		}
+	}
+}
+
+func TestUsageListsFlagsEnvVarsAndDefaults(t *testing.T) {
+	u := Usage()
+	for _, want := range []string{"-interval", "CHECK_INTERVAL_MINUTES", "-telegram-token", "TELEGRAM_BOT_TOKEN",
+		"-dry-run", "DRY_RUN", "-web-addr", "WEB_ADDR", "-state-file", "STATE_FILE", "-socket", "DOCKER_SOCKET", "/var/run/docker.sock", "60"} {
+		if !strings.Contains(u, want) {
+			t.Errorf("usage is missing %q:\n%s", want, u)
+		}
+	}
+}
+
+func TestIntervalIsCapped(t *testing.T) {
+	if c, err := Load(nil, env(map[string]string{"CHECK_INTERVAL_MINUTES": "525600"})); err != nil || c.Interval != 525600*time.Minute {
+		t.Fatalf("%v %v", c.Interval, err)
+	}
+	if _, err := Load(nil, env(map[string]string{"CHECK_INTERVAL_MINUTES": "525601"})); err == nil {
+		t.Fatal("an interval above one year must be rejected")
+	}
+	if _, err := Load(nil, env(map[string]string{"CHECK_INTERVAL_MINUTES": "99999999999999999999"})); err == nil {
+		t.Fatal("overflowing interval must be rejected")
 	}
 }
