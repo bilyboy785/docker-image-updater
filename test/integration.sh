@@ -224,7 +224,9 @@ scan_post() { curl -s -m 3 -o /dev/null -w '%{http_code}' -X POST "$@" "$SCAN_UR
 assert_eq "scan without the X-Requested-With header is rejected" "403" "$(scan_post)"
 assert_eq "scan with a foreign Origin is rejected" "403" "$(scan_post -H 'X-Requested-With: docker-image-updater' -H 'Origin: http://evil.example')"
 assert_eq "GET on the scan endpoint is not allowed" "405" "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "$SCAN_URL" || true)"
-assert_contains "rejected scan requests did not start a scan" '"scans":1,' "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+REJECTED_STATS="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+assert_contains "rejected scan requests did not start a scan" '"scans":1,' "$REJECTED_STATS"
+assert_contains "no scan is running after rejected requests" '"scanning":false' "$REJECTED_STATS"
 # The last scan may have started less than 30 s ago: retry while the server answers 429.
 SCAN_CODE=""
 for _ in $(seq 1 40); do
