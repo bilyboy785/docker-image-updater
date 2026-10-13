@@ -102,3 +102,45 @@ func TestFailedRenameRemovesTempFile(t *testing.T) {
 		t.Fatalf("temp file left behind: %v", entries)
 	}
 }
+
+func TestScanning(t *testing.T) {
+	s, _ := New("v", "active", "")
+	if s.Snapshot().Scanning {
+		t.Fatal("scanning must start false")
+	}
+	s.SetScanning(true)
+	if !s.Snapshot().Scanning {
+		t.Fatal("scanning not set")
+	}
+	s.SetScanning(false)
+	if s.Snapshot().Scanning {
+		t.Fatal("scanning not cleared")
+	}
+}
+
+func TestScanningIsNotPersisted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, _ := New("v", "active", path)
+	s.SetScanning(true)
+	s.RecordEvent(Event{Status: StatusUpdated}) // triggers a save while scanning
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"scanning":false`) {
+		t.Fatalf("scanning leaked into the state file: %s", b)
+	}
+	s2, _ := New("v", "active", path)
+	if s2.Snapshot().Scanning {
+		t.Fatal("scanning must be false after a reload")
+	}
+}
+
+func TestScanningJSONKeyIsLast(t *testing.T) {
+	s, _ := New("v", "active", "")
+	s.SetScanning(true)
+	b, _ := json.Marshal(s.Snapshot())
+	if !strings.HasSuffix(string(b), `,"scanning":true}`) {
+		t.Fatalf("scanning must be the last key: %s", b)
+	}
+}

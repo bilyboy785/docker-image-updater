@@ -48,6 +48,7 @@ type Snapshot struct {
 	Failures   int       `json:"failures"`
 	Rollbacks  int       `json:"rollbacks"`
 	Events     []Event   `json:"events"`
+	Scanning   bool      `json:"scanning"`
 }
 
 // Stats is a concurrency-safe store of counters and recent events, optionally persisted to a file.
@@ -100,6 +101,13 @@ func (s *Stats) SetNextScan(t time.Time) {
 	s.snap.NextScan = t
 }
 
+// SetScanning records whether a scan is currently running. It is never persisted.
+func (s *Stats) SetScanning(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap.Scanning = v
+}
+
 // RecordEvent adds an event to the history (newest first, bounded) and updates the counters.
 func (s *Stats) RecordEvent(e Event) {
 	s.mu.Lock()
@@ -136,7 +144,9 @@ func (s *Stats) saveLocked() {
 	if s.path == "" {
 		return
 	}
-	b, err := json.Marshal(s.snap)
+	persisted := s.snap
+	persisted.Scanning = false
+	b, err := json.Marshal(persisted)
 	if err == nil {
 		tmp := filepath.Join(filepath.Dir(s.path), "."+filepath.Base(s.path)+".tmp")
 		if err = os.WriteFile(tmp, b, 0o600); err == nil {
