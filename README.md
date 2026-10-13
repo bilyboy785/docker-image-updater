@@ -121,6 +121,7 @@ Other behaviours:
 - In dry-run mode, for the updater itself and for containers started with `--rm`, an "update available" notification is sent once per container and new image, until the updater restarts.
 - Containers started with `--rm` (AutoRemove) are never touched: stopping them would make Docker delete them, so no rollback would be possible. The updater only notifies you, and you must update them manually.
 - The configuration of the image a container currently runs is read before the new image is pulled, because some image stores may remove or untag the previous image once the tag moves.
+- An image reference without a tag (`image: nginx`, `ghcr.io/owner/app`) is pulled as `:latest`, like `docker pull` does, so only that one tag is downloaded, never the whole repository. The reference stored in the container is left untouched. `nginx` and `nginx:latest` are checked as two separate references, which only costs one extra (cheap) pull.
 - If pulling an image fails (for example a private image or a registry outage), the failure is logged, counted and notified once per image and error, not on every scan.
 - When the updated container is the network provider of other containers (`network_mode: container:X`), the success notification names those containers: they share its network stack and must be restarted or recreated manually.
 - Docker calls have timeouts (1 minute, and 30 minutes for pulls), so a stuck daemon cannot block the scan loop forever.
