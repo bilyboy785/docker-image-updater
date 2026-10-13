@@ -35,6 +35,7 @@ type DockerAPI interface {
 	ImageID(ctx context.Context, ref string) (string, error)
 	ImageConfig(ctx context.Context, ref string) (map[string]any, error)
 	ImageIsLocal(ctx context.Context, id string) (bool, error)
+	ImageRepoTags(ctx context.Context, id string) ([]string, error)
 	RemoveImage(ctx context.Context, id string) error
 	CreateContainer(ctx context.Context, name string, body map[string]any) (string, error)
 	StartContainer(ctx context.Context, id string) error
@@ -512,7 +513,7 @@ func (u *Updater) recreate(ctx context.Context, c docker.Container, info *docker
 	return stats.StatusUpdated, warn, nil
 }
 
-// cleanupImage removes the image the replaced container ran, best effort: the daemon refuses
+// cleanupImage removes the untagged image the replaced container ran, best effort: the daemon refuses
 // (409) while another container still uses it, and the image may already be gone (404).
 func (u *Updater) cleanupImage(ctx context.Context, container, oldID, newID string) {
 	if oldID == "" || oldID == newID {
@@ -520,8 +521,22 @@ func (u *Updater) cleanupImage(ctx context.Context, container, oldID, newID stri
 	}
 	rctx, cancel := context.WithTimeout(ctx, u.apiTimeout)
 	defer cancel()
-	err := u.docker.RemoveImage(rctx, oldID)
 	var ae *docker.APIError
+	// Only remove an image nobody names any more: one that still carries a tag was pulled or tagged
+	// on purpose, and its tag would be lost.
+	tags, err := u.docker.ImageRepoTags(rctx, oldID)
+	switch {
+	case errors.As(err, &ae) && ae.Status == 404:
+		u.log.Debug("old image already gone", "container", container, "image_id", shortID(oldID))
+		return
+	case err != nil:
+		u.log.Warn("cannot inspect old image, keeping it", "container", container, "image_id", shortID(oldID), "error", err)
+		return
+	case len(tags) > 0:
+		u.log.Debug("old image still has tags, keeping it", "container", container, "image_id", shortID(oldID), "tags", tags)
+		return
+	}
+	err = u.docker.RemoveImage(rctx, oldID)
 	switch {
 	case err == nil:
 		u.log.Info("removed old image", "container", container, "image_id", shortID(oldID))

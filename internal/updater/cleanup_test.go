@@ -131,3 +131,39 @@ func TestCleanupRunsAfterTheGateSucceeded(t *testing.T) {
 		t.Fatalf("got %s", got)
 	}
 }
+
+func TestCleanupKeepsAnImageThatStillCarriesATag(t *testing.T) {
+	u, f, s := cleanupSetup(true)
+	f.repoTags = map[string][]string{"sha256:1": {"nginx:old"}}
+	var logs bytes.Buffer
+	u.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	u.RunOnce(context.Background())
+	if indexOf(f.calls, "rmi sha256:1") != -1 || s.Snapshot().Updates != 1 {
+		t.Fatalf("%v %+v", f.calls, s.Snapshot())
+	}
+	if !strings.Contains(logs.String(), "level=DEBUG") || strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("%s", logs.String())
+	}
+}
+
+func TestCleanupSkippedWhenTheOldImageIsAlreadyGone(t *testing.T) {
+	u, f, s := cleanupSetup(true)
+	f.repoTagsErr = &docker.APIError{Status: 404, Message: "no such image"}
+	var logs bytes.Buffer
+	u.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	u.RunOnce(context.Background())
+	if indexOf(f.calls, "rmi sha256:1") != -1 || s.Snapshot().Updates != 1 || strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("%v %+v %s", f.calls, s.Snapshot(), logs.String())
+	}
+}
+
+func TestCleanupSkippedAndWarnedWhenTheOldImageCannotBeInspected(t *testing.T) {
+	u, f, s := cleanupSetup(true)
+	f.repoTagsErr = errors.New("daemon busy")
+	var logs bytes.Buffer
+	u.log = slog.New(slog.NewTextHandler(&logs, nil))
+	u.RunOnce(context.Background())
+	if indexOf(f.calls, "rmi sha256:1") != -1 || s.Snapshot().Updates != 1 || !strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("%v %+v %s", f.calls, s.Snapshot(), logs.String())
+	}
+}
