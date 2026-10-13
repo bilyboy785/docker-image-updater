@@ -180,6 +180,9 @@ func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.C
 	if u.isLocalImage(ctx, ref, cs) {
 		return len(cs)
 	}
+	// Read the config of the images currently run before the pull: with some image stores the pull
+	// deletes an image whose tag it replaces, and the config is needed to recreate the containers.
+	cfgs := u.oldConfigs(ctx, cs)
 	pctx, pcancel := context.WithTimeout(ctx, u.pullTimeout)
 	auth := ""
 	if u.auth != nil {
@@ -203,10 +206,27 @@ func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.C
 			return 0 // shutting down: do not turn that into a failed update
 		}
 		if c.ImageID != newID {
-			u.handle(ctx, c, ref, newID, all)
+			u.handle(ctx, c, ref, newID, all, cfgs)
 		}
 	}
 	return 0
+}
+
+// oldConfigs reads, best effort, the config of every distinct image the containers of cs run.
+func (u *Updater) oldConfigs(ctx context.Context, cs []docker.Container) map[string]map[string]any {
+	out := map[string]map[string]any{}
+	for _, c := range cs {
+		if _, ok := out[c.ImageID]; ok {
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, u.apiTimeout)
+		cfg, err := u.docker.ImageConfig(cctx, c.ImageID)
+		cancel()
+		if err == nil {
+			out[c.ImageID] = cfg
+		}
+	}
+	return out
 }
 
 // isLocalImage reports whether every image run by the containers of a group never came from a
@@ -285,7 +305,7 @@ func (u *Updater) announceAvailable(ctx context.Context, ev stats.Event, c docke
 		html.EscapeString(ev.Container), html.EscapeString(ev.Image), ev.OldID, ev.NewID, note))
 }
 
-func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID string, all []docker.Container) {
+func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID string, all []docker.Container, cfgs map[string]map[string]any) {
 	ev := stats.Event{Container: c.Name(), Image: ref, OldID: shortID(c.ImageID), NewID: shortID(newID)}
 	self := u.isSelf(c)
 	if self || u.dryRun {
@@ -327,7 +347,7 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 		return
 	}
 	u.log.Info("updating container", "container", ev.Container, "image", ref)
-	status, warn, err := u.recreate(ctx, c, info, newID)
+	status, warn, err := u.recreate(ctx, c, info, newID, cfgs)
 	var dependants []string
 	if status == stats.StatusUpdated {
 		dependants = dependantsOf(c, all)
@@ -391,7 +411,7 @@ func (u *Updater) notify(ctx context.Context, text string) {
 // Once the old container is touched the work must finish or be rolled back, so every step runs
 // on a context detached from the caller's cancellation (bounded by a timeout). The returned
 // warning is non-empty when the update succeeded but left something to clean up.
-func (u *Updater) recreate(ctx context.Context, c docker.Container, info *docker.ContainerInfo, newImageID string) (status, warn string, err error) {
+func (u *Updater) recreate(ctx context.Context, c docker.Container, info *docker.ContainerInfo, newImageID string, cfgs map[string]map[string]any) (status, warn string, err error) {
 	spec := buildCreateSpec(info, newImageID)
 	name := c.Name()
 
@@ -400,14 +420,18 @@ func (u *Updater) recreate(ctx context.Context, c docker.Container, info *docker
 
 	// The inspected config merges the old image's defaults with the container's own settings:
 	// drop the former so the new image's defaults apply. This is best effort.
-	cctx, ccancel := context.WithTimeout(opctx, u.apiTimeout)
-	imgCfg, cfgErr := u.docker.ImageConfig(cctx, c.ImageID)
-	ccancel()
-	if cfgErr != nil {
-		u.log.Warn("cannot read the old image config, recreating with the inspected config as is",
-			"container", name, "error", cfgErr)
-	} else {
+	if imgCfg, ok := cfgs[c.ImageID]; ok {
 		stripImageDefaults(spec.Body, imgCfg)
+	} else {
+		cctx, ccancel := context.WithTimeout(opctx, u.apiTimeout)
+		imgCfg, cfgErr := u.docker.ImageConfig(cctx, c.ImageID)
+		ccancel()
+		if cfgErr != nil {
+			u.log.Warn("cannot read the old image config, recreating with the inspected config as is",
+				"container", name, "error", cfgErr)
+		} else {
+			stripImageDefaults(spec.Body, imgCfg)
+		}
 	}
 
 	if err := u.docker.RenameContainer(opctx, c.ID, name+"_old"); err != nil {

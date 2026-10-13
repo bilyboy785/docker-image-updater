@@ -26,12 +26,14 @@ type fakeDocker struct {
 	onPull     func()            // optional hook, runs inside PullImage
 	onStop     func()            // optional hook, runs inside StopContainer
 
-	imageCfg    map[string]any // returned by ImageConfig
-	imageCfgErr error
-	localChecks int
-	localErr    map[string]error // image id -> error from ImageIsLocal
-	localImages map[string]bool  // image ids that never came from a registry
-	created     []map[string]any // bodies passed to CreateContainer
+	imageCfg         map[string]any // returned by ImageConfig
+	imageCfgErr      error
+	oldGoneAfterPull bool // ImageConfig fails once PullImage ran, like the containerd store dropping a replaced image
+	pulled           bool
+	localChecks      int
+	localErr         map[string]error // image id -> error from ImageIsLocal
+	localImages      map[string]bool  // image ids that never came from a registry
+	created          []map[string]any // bodies passed to CreateContainer
 }
 
 func (f *fakeDocker) rec(s string)        { f.calls = append(f.calls, s) }
@@ -53,6 +55,7 @@ func (f *fakeDocker) InspectContainer(ctx context.Context, id string) (*docker.C
 }
 func (f *fakeDocker) PullImage(ctx context.Context, ref, registryAuth string) error {
 	f.rec("pull " + ref)
+	f.pulled = true
 	if f.pullAuth == nil {
 		f.pullAuth = map[string]string{}
 	}
@@ -71,6 +74,9 @@ func (f *fakeDocker) ImageID(ctx context.Context, ref string) (string, error) {
 func (f *fakeDocker) ImageConfig(ctx context.Context, ref string) (map[string]any, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if f.oldGoneAfterPull && f.pulled {
+		return nil, &docker.APIError{Status: 404, Message: "no such image"}
 	}
 	return f.imageCfg, f.imageCfgErr
 }
@@ -500,6 +506,21 @@ func TestCreateBodyIsStrippedOfOldImageDefaults(t *testing.T) {
 	}
 	if _, ok := body["Cmd"]; ok {
 		t.Errorf("cmd must come from the new image: %v", body["Cmd"])
+	}
+}
+
+func TestOldImageConfigIsReadBeforeThePullReplacesIt(t *testing.T) {
+	info := basicInfo("a")
+	info.Config["Env"] = []any{"PG_MAJOR=16", "CUSTOM=yes"}
+	f := &fakeDocker{containers: []docker.Container{web("a", "nginx:latest", "sha256:1", nil)},
+		info:             map[string]*docker.ContainerInfo{"a": info},
+		images:           map[string]string{"nginx:latest": "sha256:2"},
+		imageCfg:         map[string]any{"Env": []any{"PG_MAJOR=16"}},
+		oldGoneAfterPull: true}
+	u, _, s := newUpdater(f, false)
+	u.RunOnce(context.Background())
+	if s.Snapshot().Updates != 1 || !reflect.DeepEqual(f.created[0]["Env"], []any{"CUSTOM=yes"}) {
+		t.Fatalf("old defaults must still be stripped: %v", f.created)
 	}
 }
 
