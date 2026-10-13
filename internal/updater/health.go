@@ -63,6 +63,7 @@ func (u *Updater) waitHealthy(ctx, caller context.Context, newID string, wait ti
 	seen, lastHealth := false, false
 	errs := 0
 	for {
+		u.touch()
 		if caller.Err() != nil {
 			return "", &gateError{"updater stopping during health gate"}
 		}

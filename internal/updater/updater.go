@@ -121,8 +121,17 @@ func trunc(s string, n int) string {
 	return s
 }
 
+// touch tells the stats store that the scan is still making progress, which keeps /healthz from
+// calling a long but working scan stale.
+func (u *Updater) touch() {
+	if u.stats != nil {
+		u.stats.Touch()
+	}
+}
+
 // note records what the current scan found about container c (running image ref).
 func (u *Updater) note(c docker.Container, ref, status, detail string) {
+	u.touch()
 	pol := "auto"
 	if p, err := ParsePolicy(c.Labels); err == nil && p.Notify {
 		pol = "notify"
@@ -149,6 +158,7 @@ func (u *Updater) publishReport() {
 // RunOnce performs one full scan.
 func (u *Updater) RunOnce(ctx context.Context) error {
 	start := time.Now()
+	u.touch()
 	u.report = map[string]stats.ContainerStatus{}
 	lctx, lcancel := context.WithTimeout(ctx, u.apiTimeout)
 	containers, err := u.docker.ListContainers(lctx)
@@ -239,6 +249,7 @@ func (u *Updater) configImage(ctx context.Context, id string) string {
 // full container list of the scan, used to find containers depending on an updated one.
 // It returns the number of containers it skipped because their image was built locally.
 func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.Container) int {
+	u.touch()
 	if u.isLocalImage(ctx, ref, cs) {
 		for _, c := range cs {
 			u.note(c, ref, stats.ContainerSkipped, "locally built image")
@@ -255,6 +266,7 @@ func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.C
 	}
 	err := u.docker.PullImage(pctx, ref, auth)
 	pcancel()
+	u.touch()
 	if err != nil {
 		u.noteAll(ctx, cs, ref, stats.ContainerFailed, "pull failed: "+err.Error())
 		u.reportImageFailure(ctx, "pull", ref, cs, err)
@@ -263,6 +275,7 @@ func (u *Updater) checkImage(ctx context.Context, ref string, cs, all []docker.C
 	ictx, icancel := context.WithTimeout(ctx, u.apiTimeout)
 	newID, err := u.docker.ImageID(ictx, ref)
 	icancel()
+	u.touch()
 	if err != nil {
 		u.noteAll(ctx, cs, ref, stats.ContainerFailed, "image lookup failed: "+err.Error())
 		u.reportImageFailure(ctx, "image id", ref, cs, err)
@@ -563,11 +576,13 @@ func (u *Updater) recreate(ctx context.Context, c docker.Container, info *docker
 	if err := u.docker.RenameContainer(opctx, c.ID, name+"_old"); err != nil {
 		return stats.StatusFailed, "", fmt.Errorf("rename old container: %w", err)
 	}
+	u.touch()
 	if err := u.docker.StopContainer(opctx, c.ID); err != nil {
 		// The daemon may already have stopped it: restore the name and make sure it runs.
 		st, e := u.rollback(opctx, c, name, "", fmt.Errorf("stop old container: %w", err))
 		return st, "", e
 	}
+	u.touch()
 	newID, err := u.docker.CreateContainer(opctx, name, spec.Body)
 	if err != nil {
 		st, e := u.rollback(opctx, c, name, "", fmt.Errorf("create new container: %w", err))
@@ -583,6 +598,7 @@ func (u *Updater) recreate(ctx context.Context, c docker.Container, info *docker
 		st, e := u.rollback(opctx, c, name, newID, fmt.Errorf("start new container: %w", err))
 		return st, "", e
 	}
+	u.touch()
 	note, gerr := u.waitHealthy(opctx, ctx, newID, u.healthWait)
 	if gerr != nil {
 		st, e := u.rollback(opctx, c, name, newID, gerr)
