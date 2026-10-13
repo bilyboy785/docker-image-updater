@@ -15,8 +15,17 @@ FAILS=0
 
 HOST_DOCKER() { env -u DOCKER_HOST docker "$@"; }
 
+DIND_VERIFIED=0
+
 cleanup() {
+  local rc=$?
   set +e
+  # On failure, print diagnostics from the dind daemon (never the host one).
+  if [ "$rc" -ne 0 ] && [ "$DIND_VERIFIED" == 1 ]; then
+    echo "==> FAILURE (exit $rc), diagnostics from the dind daemon"
+    docker ps -a || true
+    docker logs diu-updater || true
+  fi
   HOST_DOCKER rm -f -v diu-dind >/dev/null 2>&1
   rm -rf "$WORK"
 }
@@ -25,6 +34,12 @@ trap cleanup EXIT
 assert_eq() { # description expected actual
   if [ "$2" == "$3" ]; then echo "  ok   $1"; else echo "  FAIL $1: expected '$2', got '$3'"; FAILS=$((FAILS + 1)); fi
 }
+# Run a command quietly, printing its output only if it fails.
+quiet() {
+  local out
+  out="$("$@" 2>&1)" || { echo "$out"; return 1; }
+}
+
 assert_contains() { # description needle haystack
   if [[ "$3" == *"$2"* ]]; then echo "  ok   $1"; else echo "  FAIL $1: '$2' not found in '$3'"; FAILS=$((FAILS + 1)); fi
 }
@@ -48,6 +63,7 @@ DIND_ID="$(docker info --format '{{.ID}}')"
 if [ -z "$DIND_ID" ] || [ "$DIND_ID" == "$HOST_ID" ] || docker ps -a --format '{{.Names}}' | grep -q '^diu-dind$'; then
   echo "SAFETY: DOCKER_HOST does not point at the isolated dind daemon, aborting"; exit 1
 fi
+DIND_VERIFIED=1
 
 echo "==> loading the updater image into dind"
 env -u DOCKER_HOST docker save "$IMAGE" | docker load >/dev/null
@@ -81,7 +97,8 @@ EOF
 
 echo "==> starting local registry"
 docker run -d --name diu-registry --label docker-image-updater.enable=false -p "${REG_PORT}:5000" registry:2 >/dev/null
-for _ in $(seq 1 30); do curl -sf "http://127.0.0.1:${REG_PORT}/v2/" >/dev/null && break; sleep 1; done
+for _ in $(seq 1 30); do curl -sf -m 3 "http://127.0.0.1:${REG_PORT}/v2/" >/dev/null && { reg_ok=1; break; }; sleep 1; done
+[ "${reg_ok:-0}" == 1 ] || { echo "registry did not become ready"; exit 1; }
 REG_ID="$(docker inspect -f '{{.Id}} {{.State.StartedAt}}' diu-registry)"
 
 echo "==> publishing image v1 and starting workloads"
@@ -92,8 +109,8 @@ docker run -d --name diu-run --label keep=me -v diu-vol:/data "$REF" >/dev/null
 docker run -d --name diu-optout --label docker-image-updater.enable=false "$REF" >/dev/null
 docker run -d --name diu-anonv -v /anonv "$REF" >/dev/null
 docker run -d --name diu-anonm --mount type=volume,dst=/anonm "$REF" >/dev/null
-docker compose -p diu-compose -f "$WORK/compose.yml" up -d >/dev/null 2>&1
-docker compose -p diu-custom -f "$WORK/compose.yml" up -d >/dev/null 2>&1
+quiet docker compose -p diu-compose -f "$WORK/compose.yml" up -d
+quiet docker compose -p diu-custom -f "$WORK/compose.yml" up -d
 
 id_of() { docker ps -q --filter "label=com.docker.compose.project=$1"; }
 COMPOSE_ID="$(id_of diu-compose)"
@@ -118,7 +135,8 @@ docker run -d --name diu-updater \
 echo "==> waiting for the updates to be applied"
 ok=0
 for _ in $(seq 1 120); do
-  if curl -sf "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -q '"updates":5,'; then ok=1; break; fi
+  stats="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" || true)"
+  if [[ "$stats" == *'"updates":5,'* && "$stats" == *'"scans":1,'* ]]; then ok=1; break; fi
   sleep 1
 done
 if [ "$ok" != 1 ]; then echo "timeout waiting for updates"; docker logs diu-updater; exit 1; fi
@@ -146,10 +164,10 @@ assert_contains "compose network preserved" "diu-compose_backend" "$(docker insp
 assert_contains "compose -p network preserved" "diu-custom_backend" "$(docker inspect -f '{{json .NetworkSettings.Networks}}' "$CUSTOM_NEW")"
 assert_eq "no leftover _old container" "0" "$(docker ps -a --format '{{.Names}}' | grep -c '_old$' || true)"
 assert_eq "updater still running" "true" "$(docker inspect -f '{{.State.Running}}' diu-updater)"
-docker compose -p diu-compose -f "$WORK/compose.yml" up -d >/dev/null 2>&1
+quiet docker compose -p diu-compose -f "$WORK/compose.yml" up -d
 assert_eq "docker compose up does not recreate the container again" "$COMPOSE_NEW" "$(id_of diu-compose)"
-assert_contains "stats API counts the scan" '"scans":1,' "$(curl -sf "http://127.0.0.1:${WEB_PORT}/api/stats")"
-assert_eq "healthz" "ok" "$(curl -sf "http://127.0.0.1:${WEB_PORT}/healthz")"
+assert_contains "stats API counts the scan" '"scans":1,' "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+assert_eq "healthz" "ok" "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/healthz")"
 
 if [ "$FAILS" -ne 0 ]; then echo "$FAILS assertion(s) failed"; docker logs diu-updater; exit 1; fi
 echo "PASS"

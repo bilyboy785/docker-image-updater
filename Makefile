@@ -16,6 +16,6 @@ test-pkg:
 build:
 	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):dev .
 
-# End-to-end test against the real Docker daemon and a local registry.
+# End-to-end test inside an isolated docker:dind daemon (never the developer's Docker daemon).
 test-integration: build
 	IMAGE=$(IMAGE):dev ./test/integration.sh
