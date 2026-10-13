@@ -114,27 +114,37 @@ func TestImageID(t *testing.T) {
 	}
 }
 
-func TestImageRepoDigests(t *testing.T) {
-	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/images/sha256:aaa/json":
-			w.Write([]byte(`{"Id":"sha256:aaa","RepoDigests":["app@sha256:111"]}`))
-		case "/images/sha256:bbb/json":
-			w.Write([]byte(`{"Id":"sha256:bbb","RepoDigests":null}`))
-		default:
-			http.Error(w, "no such image", http.StatusNotFound)
-		}
-	})
-	d, err := c.ImageRepoDigests(context.Background(), "sha256:aaa")
-	if err != nil || len(d) != 1 || d[0] != "app@sha256:111" {
-		t.Fatalf("%v %v", d, err)
+func TestImageIsLocal(t *testing.T) {
+	bodies := map[string]string{
+		"classic-local":  `{"Id":"x","RepoDigests":[]}`,
+		"classic-null":   `{"Id":"x","RepoDigests":null}`,
+		"classic-pulled": `{"Id":"x","RepoDigests":["app@sha256:111"]}`,
+		"cd-local":       `{"Id":"x","RepoDigests":["app@sha256:x"],"Identity":{"Build":[{"Ref":"r","CreatedAt":"t"}]}}`,
+		"cd-pulled":      `{"Id":"x","RepoDigests":["app@sha256:111"],"Identity":{"Pull":[{"Repository":"docker.io/library/busybox"}]}}`,
+		"cd-both":        `{"Id":"x","Identity":{"Pull":[{"Repository":"r"}],"Build":[{"Ref":"r"}]}}`,
+		"cd-empty":       `{"Id":"x","RepoDigests":[],"Identity":{}}`,
+		"cd-null-lists":  `{"Id":"x","Identity":{"Pull":null,"Build":null}}`,
+		"cd-unknown":     `{"Id":"x","Future":1,"Identity":{"Build":[{"Ref":"r","New":{"a":1}}],"Other":true}}`,
 	}
-	d, err = c.ImageRepoDigests(context.Background(), "sha256:bbb")
-	if err != nil || len(d) != 0 {
-		t.Fatalf("%v %v", d, err)
+	want := map[string]bool{"classic-local": true, "classic-null": true, "classic-pulled": false,
+		"cd-local": true, "cd-pulled": false, "cd-both": false, "cd-empty": false, "cd-null-lists": false, "cd-unknown": true}
+	c := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/images/"), "/json")
+		body, ok := bodies[name]
+		if !ok {
+			http.Error(w, "no such image", http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(body))
+	})
+	for name, exp := range want {
+		got, err := c.ImageIsLocal(context.Background(), name)
+		if err != nil || got != exp {
+			t.Errorf("%s: got %v, %v want %v", name, got, err, exp)
+		}
 	}
 	var apiErr *APIError
-	if _, err = c.ImageRepoDigests(context.Background(), "sha256:ccc"); !errors.As(err, &apiErr) || apiErr.Status != 404 {
+	if _, err := c.ImageIsLocal(context.Background(), "missing"); !errors.As(err, &apiErr) || apiErr.Status != 404 {
 		t.Fatalf("got %v", err)
 	}
 }

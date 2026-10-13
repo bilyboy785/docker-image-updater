@@ -153,16 +153,28 @@ func (c *Client) ImageID(ctx context.Context, ref string) (string, error) {
 	return out.ID, nil
 }
 
-// ImageRepoDigests returns the registry digests of a local image (its RepoDigests). The list is
-// empty for an image that never came from a registry: built locally or loaded from an archive.
-func (c *Client) ImageRepoDigests(ctx context.Context, id string) ([]string, error) {
+// ImageIsLocal reports whether an image never came from a registry: it was built locally or
+// loaded from an archive, so it cannot be pulled.
+//
+// With the containerd image store, the image inspection has an Identity object: an image is
+// local when it has build records and no pull record. Anything else, including an empty
+// Identity, is not local. With the classic store there is no Identity: an image is local when it
+// has no repo digest.
+func (c *Client) ImageIsLocal(ctx context.Context, id string) (bool, error) {
 	var out struct {
 		RepoDigests []string
+		Identity    *struct {
+			Pull  []json.RawMessage
+			Build []json.RawMessage
+		}
 	}
 	if err := c.do(ctx, "GET", "/images/"+id+"/json", nil, nil, &out); err != nil {
-		return nil, err
+		return false, err
 	}
-	return out.RepoDigests, nil
+	if out.Identity != nil {
+		return len(out.Identity.Pull) == 0 && len(out.Identity.Build) > 0, nil
+	}
+	return len(out.RepoDigests) == 0, nil
 }
 
 // CreateContainer creates a container from a full create payload and returns its ID.
