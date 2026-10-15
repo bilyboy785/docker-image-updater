@@ -395,3 +395,28 @@ func TestPageHasPerContainerScanButton(t *testing.T) {
 		t.Error("index.html must not use innerHTML")
 	}
 }
+
+func TestUnrelatedMalformedQueryDoesNotBreakAFullScan(t *testing.T) {
+	for _, q := range []string{"x=%zz", "a=1;b=2", "%zz=1"} {
+		h, calls := scanHandler(ScanResult{Status: ScanStarted})
+		rec := postTo(h, "/api/scan?"+q, csrfHeader)
+		if rec.Code != 202 || *calls != 1 || lastScanRequest != (ScanRequest{}) {
+			t.Fatalf("%q: %d calls=%d", q, rec.Code, *calls)
+		}
+	}
+	for _, q := range []string{"container=%zz", "x=1&container=%zz", "container=%zz&container=web"} {
+		h, calls := scanHandler(ScanResult{Status: ScanStarted})
+		rec := postTo(h, "/api/scan?"+q, csrfHeader)
+		if rec.Code != 400 || *calls != 0 {
+			t.Fatalf("%q: %d calls=%d", q, rec.Code, *calls)
+		}
+	}
+}
+
+func TestValidContainerWithUnrelatedMalformedParameterIsAccepted(t *testing.T) {
+	h, calls := scanHandler(ScanResult{Status: ScanStarted})
+	rec := postTo(h, "/api/scan?container=web&x=%zz", csrfHeader)
+	if rec.Code != 202 || *calls != 1 || lastScanRequest.Container != "web" {
+		t.Fatalf("%d calls=%d %+v", rec.Code, *calls, lastScanRequest)
+	}
+}

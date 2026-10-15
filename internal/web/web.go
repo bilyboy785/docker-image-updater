@@ -155,9 +155,22 @@ func Handler(snap func() stats.Snapshot, trigger func(ScanRequest) ScanResult, o
 			Status    string `json:"status"`
 			Container string `json:"container,omitempty"`
 		}{Status: "started"}
+		// A malformed query only matters when it hides the container parameter: ParseQuery drops the
+		// pairs it cannot decode, and the full scan must not depend on unrelated parameters.
 		query, err := url.ParseQuery(r.URL.RawQuery)
 		values, present := query["container"]
-		if err != nil || (present && (len(values) != 1 || !validContainerName(values[0]))) {
+		if err != nil {
+			raw := 0
+			for _, pair := range strings.Split(r.URL.RawQuery, "&") {
+				if key, _, _ := strings.Cut(pair, "="); key == "container" {
+					raw++
+				}
+			}
+			if raw > len(values) { // a container parameter could not be decoded
+				present, values = true, append(values, "", "")
+			}
+		}
+		if present && (len(values) != 1 || !validContainerName(values[0])) {
 			writeError(w, http.StatusBadRequest, "invalid container name")
 			return
 		}
