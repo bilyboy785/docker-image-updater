@@ -128,13 +128,16 @@ build_push() { # version
 # containers run v1 and the updater itself must be the one to pull v2, as in real life. The v1
 # image is kept under a second name meanwhile (with the containerd store, replacing a tag deletes
 # the image that had it).
-publish_v2_over_v1() { # ref [healthcheck-line] [cmd-line]
+publish_next_over_current() { # ref version [healthcheck-line] [cmd-line]
   local ref="$1" keep
   keep="diu-keep:$(printf '%s' "$1" | tr '/:' '__')"
   docker tag "$ref" "$keep"
-  publish_image "$ref" 2 "${2:-}" "${3:-}"
+  publish_image "$ref" "$2" "${3:-}" "${4:-}"
   docker tag "$keep" "$ref"
   docker rmi "$keep" >/dev/null
+}
+publish_v2_over_v1() { # ref [healthcheck-line] [cmd-line]
+  publish_next_over_current "$1" 2 "${2:-}" "${3:-}"
 }
 
 dind_login() {
@@ -294,6 +297,18 @@ events_of() { sed -e 's/.*"events":\[//' -e 's/\],"scanning":.*//'; }
 # cstatus NAME STATS-JSON: status of container NAME in the container list.
 cstatus() {
   grep -o "\"name\":\"$1\",\"image\":\"[^\"]*\",\"image_id\":\"[^\"]*\",\"status\":\"[^\"]*\"" <<< "$2" | head -1 | sed -e 's/.*"status":"//' -e 's/"$//'
+}
+# cchecked NAME STATS-JSON: checked_at of container NAME in the container list.
+cchecked() {
+  grep -o "\"name\":\"$1\",[^}]*" <<< "$2" | head -1 | sed -e 's/.*"checked_at":"//' -e 's/".*//'
+}
+# jnum FIELD STATS-JSON: numeric top-level field of a stats document already fetched.
+jnum() {
+  grep -o "\"$1\":[0-9]*" <<< "$2" | head -1 | cut -d: -f2
+}
+# jstr FIELD STATS-JSON: string value of a top-level field of the stats document.
+jstr() {
+  grep -o "\"$1\":\"[^\"]*\"" <<< "$2" | head -1 | cut -d: -f2-
 }
 # cdetail NAME STATS-JSON: detail of container NAME in the container list.
 cdetail() {
@@ -491,6 +506,99 @@ assert_eq "the updater itself is listed as skipped (opt-out) after the forced sc
 assert_eq "diu-notify has exactly one event" "1" "$(grep -o '"container":"diu-notify"' <<< "$STATS2" | wc -l | tr -d ' ')"
 assert_contains "the notify event has the available status" '"status":"available"' "$STATS2"
 assert_eq "diu-window has no event after the forced scan" "0" "$(events_of <<< "$STATS2" | grep -c 'diu-window' || true)"
+
+echo "==> scanning a single container from the web API"
+# Publish v3 of two images used by two different, already updated containers (they run v2).
+CLEAN_V2="$(docker inspect -f '{{.Image}}' diu-clean)"
+CLEAN_CID2="$(docker inspect -f '{{.Id}}' diu-clean)"
+PLAIN_V2="$(docker inspect -f '{{.Image}}' diu-plain)"
+PLAIN_CID2="$(docker inspect -f '{{.Id}}' diu-plain)"
+publish_next_over_current "$CLEAN_REF" 3 "$HC_OK"
+publish_next_over_current "$PLAIN_REF" 3
+assert_eq "the clean image tag points at v2 again" "$CLEAN_V2" "$(docker image inspect -f '{{.Id}}' "$CLEAN_REF")"
+assert_eq "the plain image tag points at v2 again" "$PLAIN_V2" "$(docker image inspect -f '{{.Id}}' "$PLAIN_REF")"
+# Wait for the end of the forced scan (the scan counter moves before the scanning flag drops).
+idle=0
+for _ in $(seq 1 60); do
+  if grep -q '"scanning":false' <<< "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"; then idle=1; break; fi
+  sleep 1
+done
+assert_eq "no scan is running before the targeted scan" "1" "$idle"
+STATS_PRE="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+assert_eq "scan count before the targeted scan" "2" "$(stat scans)"
+# scan_post_body ARGS...: prints "<http code> <body>".
+scan_post_body() { curl -s -m 3 -w ' %{http_code}' -X POST "$@" || true; }
+assert_match "a targeted scan of an unknown container is a 404" '^\{"error":"[^"]*"\} 404$' "$(scan_post_body -H 'X-Requested-With: docker-image-updater' "$SCAN_URL?container=diu-nope" | tr -d '\n')"
+assert_match "a targeted scan of a malformed name is a 400" '^\{"error":"[^"]*"\} 400$' "$(scan_post_body -H 'X-Requested-With: docker-image-updater' "$SCAN_URL?container=a%2Fb" | tr -d '\n')"
+assert_match "a targeted scan with an empty name is a 400" ' 400$' "$(scan_post_body -H 'X-Requested-With: docker-image-updater' "$SCAN_URL?container=" | tr -d '\n')"
+assert_match "a targeted scan without the header is a 403" ' 403$' "$(scan_post_body "$SCAN_URL?container=diu-clean" | tr -d '\n')"
+assert_match "a targeted scan with a foreign Origin is a 403" ' 403$' "$(scan_post_body -H 'X-Requested-With: docker-image-updater' -H 'Origin: http://evil.example' "$SCAN_URL?container=diu-clean" | tr -d '\n')"
+assert_eq "rejected targeted requests did not start a scan" "2" "$(stat scans)"
+# The previous scan may have started less than 5 s ago: retry while the server answers 429.
+TARGET_OUT=""
+for _ in $(seq 1 20); do
+  TARGET_OUT="$(scan_post_body -H 'X-Requested-With: docker-image-updater' "$SCAN_URL?container=diu-clean" | tr -d '\n')"
+  [[ "$TARGET_OUT" == *' 429' ]] || break
+  sleep 1
+done
+assert_eq "the targeted scan of diu-clean is accepted and names the container" '{"status":"started","container":"diu-clean"} 202' "$TARGET_OUT"
+assert_match "a second request right after is refused" '^(409|429)$' "$(scan_post -H 'X-Requested-With: docker-image-updater')"
+scan3=0
+for _ in $(seq 1 120); do
+  if [ "$(stat scans || true)" == 3 ] && grep -q '"scanning":false' <<< "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"; then scan3=1; break; fi
+  sleep 1
+done
+assert_eq "the targeted scan ran (scans count reached 3)" "1" "$scan3"
+STATS4="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+CLEAN_V3="$(docker image inspect -f '{{.Id}}' "$CLEAN_REF")"
+assert_eq "the updater pulled the new diu-clean image" "1" "$([ "$CLEAN_V3" != "$CLEAN_V2" ] && echo 1 || echo 0)"
+assert_eq "diu-clean runs the v3 image" "$CLEAN_V3" "$(docker inspect -f '{{.Image}}' diu-clean)"
+assert_eq "diu-clean was recreated by the targeted scan" "1" "$([ "$CLEAN_CID2" != "$(docker inspect -f '{{.Id}}' diu-clean)" ] && echo 1 || echo 0)"
+assert_eq "diu-clean new version is running" "3" "$(docker exec diu-clean cat /version)"
+assert_eq "diu-clean has an updated event for each of its two updates" "2" "$(events_of <<< "$STATS4" | grep -o '"container":"diu-clean","image":"[^"]*","old_id":"[^"]*","new_id":"[^"]*","status":"updated"' | wc -l | tr -d ' ')"
+assert_eq "diu-plain was NOT updated by the targeted scan (same container id)" "$PLAIN_CID2" "$(docker inspect -f '{{.Id}}' diu-plain)"
+assert_eq "diu-plain still runs v2" "$PLAIN_V2" "$(docker inspect -f '{{.Image}}' diu-plain)"
+assert_eq "diu-plain image was NOT pulled by the targeted scan (tag still on v2)" "$PLAIN_V2" "$(docker image inspect -f '{{.Id}}' "$PLAIN_REF")"
+assert_eq "updates count after the targeted scan" "9" "$(stat updates)"
+assert_eq "rollbacks count after the targeted scan" "2" "$(stat rollbacks)"
+assert_eq "failures count after the targeted scan" "0" "$(stat failures)"
+assert_eq "the targeted scan counts as a scan" "3" "$(stat scans)"
+assert_eq "the watched gauge is not overwritten by the partial scan" "$(jnum watched "$STATS_PRE")" "$(jnum watched "$STATS4")"
+assert_eq "the skipped gauge is not overwritten by the partial scan" "$(jnum skipped "$STATS_PRE")" "$(jnum skipped "$STATS4")"
+assert_eq "the targeted scan does not move the periodic schedule" "$(jstr next_scan "$STATS_PRE")" "$(jstr next_scan "$STATS4")"
+assert_eq "the container list still has the same number of entries" "$(grep -o '"checked_at"' <<< "$STATS_PRE" | wc -l | tr -d ' ')" "$(grep -o '"checked_at"' <<< "$STATS4" | wc -l | tr -d ' ')"
+assert_eq "diu-clean is listed as updated" "updated" "$(cstatus diu-clean "$STATS4")"
+assert_eq "diu-clean entry was refreshed" "1" "$([ "$(cchecked diu-clean "$STATS_PRE")" != "$(cchecked diu-clean "$STATS4")" ] && echo 1 || echo 0)"
+for name in diu-plain diu-notify diu-window diu-crash diu-local; do
+  assert_eq "$name entry is untouched by the targeted scan (same checked_at)" "$(cchecked $name "$STATS_PRE")" "$(cchecked $name "$STATS4")"
+done
+assert_eq "diu-plain is still listed as before" "$(cstatus diu-plain "$STATS_PRE")" "$(cstatus diu-plain "$STATS4")"
+assert_eq "no leftover _old container after the targeted scan" "0" "$(docker ps -a --format '{{.Names}}' | grep -c '_old$' || true)"
+
+echo "==> a full forced scan after the targeted one updates the other container"
+# The 30 s spacing of a full forced scan is measured from the start of the targeted scan.
+SCAN_CODE=""
+for _ in $(seq 1 45); do
+  SCAN_CODE="$(scan_post -H 'X-Requested-With: docker-image-updater')"
+  [ "$SCAN_CODE" == 429 ] || break
+  sleep 1
+done
+assert_eq "the full forced scan is accepted once the spacing is over" "202" "$SCAN_CODE"
+scan4=0
+for _ in $(seq 1 150); do
+  if [ "$(stat scans || true)" == 4 ] && grep -q '"scanning":false' <<< "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"; then scan4=1; break; fi
+  sleep 1
+done
+assert_eq "the full forced scan ran (scans count reached 4)" "1" "$scan4"
+PLAIN_V3="$(docker image inspect -f '{{.Id}}' "$PLAIN_REF")"
+assert_eq "the full scan pulled the new diu-plain image" "1" "$([ "$PLAIN_V3" != "$PLAIN_V2" ] && echo 1 || echo 0)"
+assert_eq "diu-plain now runs the v3 image" "$PLAIN_V3" "$(docker inspect -f '{{.Image}}' diu-plain)"
+assert_eq "diu-plain was recreated by the full scan" "1" "$([ "$PLAIN_CID2" != "$(docker inspect -f '{{.Id}}' diu-plain)" ] && echo 1 || echo 0)"
+assert_eq "diu-clean keeps the container updated by the targeted scan" "$CLEAN_V3" "$(docker inspect -f '{{.Image}}' diu-clean)"
+assert_eq "updates count after the full scan" "10" "$(stat updates)"
+assert_eq "rollbacks count after the full scan" "2" "$(stat rollbacks)"
+assert_eq "failures count after the full scan" "0" "$(stat failures)"
+assert_eq "no leftover _old container after the full scan" "0" "$(docker ps -a --format '{{.Names}}' | grep -c '_old$' || true)"
 
 assert_contains "registry credentials enabled at startup" "registry credentials enabled" "$(docker logs diu-updater 2>&1)"
 assert_eq "updater logs never contain the registry password" "0" "$(docker logs diu-updater 2>&1 | grep -c -F "$REG_PASS" || true)"
