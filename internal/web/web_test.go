@@ -384,3 +384,14 @@ func TestScanContainerWithoutTrigger(t *testing.T) {
 		t.Fatalf("%d", rec.Code)
 	}
 }
+func TestPageHasPerContainerScanButton(t *testing.T) {
+	page := string(indexHTML)
+	for _, want := range []string{"/api/scan?container=", "encodeURIComponent", "Action", "Scan ", "aria-label"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html lacks %q", want)
+		}
+	}
+	if strings.Contains(page, "innerHTML") {
+		t.Error("index.html must not use innerHTML")
+	}
+}

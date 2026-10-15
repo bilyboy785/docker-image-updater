@@ -63,6 +63,10 @@ section+section{margin-top:28px}
 .scan button:disabled{opacity:.6;cursor:default}
 .scan button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .scan .msg{font-size:12px;color:var(--muted)}
+.rowscan{font:inherit;font-size:12px;font-weight:600;padding:3px 12px;border-radius:999px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer}
+.rowscan:hover:not(:disabled){background:color-mix(in srgb,var(--accent) 16%,transparent)}
+.rowscan:disabled{opacity:.5;cursor:default}
+.rowscan:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 footer{margin-top:22px;color:var(--muted);font-size:13px;text-align:center}
 </style>
 </head>
@@ -91,7 +95,7 @@ footer{margin-top:22px;color:var(--muted);font-size:13px;text-align:center}
   <div class="chips" id="chips" role="group" aria-label="Filter containers by status"></div>
   <div class="table"><div class="scroll">
    <table id="ctable">
-    <thead><tr><th scope="col">Container</th><th scope="col">Image</th><th scope="col">Status</th><th scope="col">Detail</th><th scope="col">Policy / window</th><th scope="col">Last checked</th></tr></thead>
+    <thead><tr><th scope="col">Container</th><th scope="col">Image</th><th scope="col">Status</th><th scope="col">Detail</th><th scope="col">Policy / window</th><th scope="col">Last checked</th><th scope="col">Action</th></tr></thead>
     <tbody id="cbody"></tbody>
    </table>
   </div>
@@ -162,6 +166,7 @@ function renderContainers() {
     b.setAttribute('aria-pressed', String(key === filter));
   }
   const body = $('cbody');
+  const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.scan : undefined;
   body.replaceChildren();
   const shown = filter ? containers.filter(c => c.status === filter) : containers;
   $('cempty').hidden = shown.length > 0;
@@ -179,7 +184,17 @@ function renderContainers() {
     cell(tr, c.detail || '', 'detail');
     cell(tr, (c.policy || '') + (c.window ? ' · ' + c.window : ''));
     cell(tr, rel(c.checked_at)).title = when(c.checked_at);
+    // Every row has the button, the updater's own and the skipped ones included: scanning them is harmless
+    // (the former only announces, the latter only report why they are skipped).
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'rowscan'; btn.textContent = 'Scan';
+    btn.dataset.scan = c.name;
+    btn.setAttribute('aria-label', 'Scan ' + c.name);
+    btn.disabled = isBusy();
+    btn.addEventListener('click', () => scanNow(c.name));
+    cell(tr, '').appendChild(btn);
     body.appendChild(tr);
+    if (focused === c.name && !btn.disabled) btn.focus();
   }
 }
 
@@ -219,11 +234,13 @@ function render(s) {
 }
 
 let timer = null, scanning = false, posting = false, awaitStart = 0, inflight = false;
+const isBusy = () => scanning || posting || awaitStart > 0;
 const setButton = () => {
-  const busy = scanning || posting || awaitStart > 0;
+  const busy = isBusy();
   const btn = $('scan');
   btn.disabled = busy;
   btn.textContent = busy ? 'Scanning…' : 'Scan now';
+  for (const b of document.querySelectorAll('button.rowscan')) b.disabled = busy;
 };
 const schedule = ms => { clearTimeout(timer); timer = setTimeout(refresh, ms); };
 
@@ -253,18 +270,24 @@ async function refresh() {
 }
 
 const SCAN_MESSAGES = {
+  400: 'Invalid container name',
   403: 'Request refused (HTTP 403). If you are behind a reverse proxy, make sure it forwards the original Host header.',
+  404: 'Container not found: refresh the page',
   409: 'A scan is already running',
   429: 'Please wait before scanning again',
   501: 'Manual scans are not available'
 };
-async function scanNow() {
-  if (posting) return;
+// scanNow starts a scan of every container, or only of the container called name.
+async function scanNow(name) {
+  if (posting || isBusy()) return;
   posting = true; setButton();
   $('scanmsg').textContent = '';
   try {
-    const r = await fetch('/api/scan', {method: 'POST', headers: {'X-Requested-With': 'docker-image-updater'}});
-    if (r.status === 202) awaitStart = 5; // allow a few polls for the scan to be reported as running
+    const r = await fetch(name === undefined ? '/api/scan' : '/api/scan?container=' + encodeURIComponent(name), {method: 'POST', headers: {'X-Requested-With': 'docker-image-updater'}});
+    if (r.status === 202) {
+      awaitStart = 5; // allow a few polls for the scan to be reported as running
+      if (name !== undefined) $('scanmsg').textContent = 'Scanning ' + name;
+    }
     else $('scanmsg').textContent = SCAN_MESSAGES[r.status] || 'Could not start a scan (HTTP ' + r.status + ')';
   } catch (_) {
     $('scanmsg').textContent = 'Could not start a scan';
@@ -274,7 +297,7 @@ async function scanNow() {
   clearTimeout(timer);
   refresh();
 }
-$('scan').addEventListener('click', scanNow);
+$('scan').addEventListener('click', () => scanNow());
 buildChips();
 refresh();
 </script>
