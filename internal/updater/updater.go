@@ -181,8 +181,8 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 // RunContainer scans the running container called name and nothing else: the same checks, pull, policies,
 // update, health gate and notifications as a full scan, but no other container is looked at. Its entry
 // replaces the previous one in the published container list, the other entries are kept as they were, and the
-// watched/skipped gauges are not changed. ErrContainerNotFound is returned, and nothing is published, when no
-// running container has that name.
+// watched/skipped gauges are not changed. When no running container has that name, ErrContainerNotFound is
+// returned, no scan is recorded and the stale entry of that name is removed from the published list.
 func (u *Updater) RunContainer(ctx context.Context, name string) error {
 	return u.scan(ctx, name, true)
 }
@@ -209,6 +209,7 @@ func (u *Updater) scan(ctx context.Context, only string, partial bool) error {
 			}
 		}
 		if containers == nil {
+			u.stats.RemoveContainer(only) // it no longer exists: do not keep a stale row
 			return fmt.Errorf("%w: %q", ErrContainerNotFound, only)
 		}
 	}

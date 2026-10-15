@@ -133,7 +133,9 @@ func (s *Scheduler) begin() {
 		s.running = true
 		s.lastStart = s.now()
 	}
-	select { // a trigger accepted at the same time as a periodic scan is served by that scan
+	// A request accepted at the same time as a periodic scan is served by that scan: a full scan covers
+	// the targeted container too, and the request must not run a second scan right after.
+	select {
 	case <-s.trigger:
 	default:
 	}

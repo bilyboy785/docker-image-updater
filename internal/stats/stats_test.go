@@ -309,3 +309,15 @@ func TestRecordPartialScanCountsTheScanButKeepsTheGauges(t *testing.T) {
 		t.Fatalf("gauges must not be overwritten: %+v", snap)
 	}
 }
+
+func TestRemoveContainerDropsOnlyThatEntry(t *testing.T) {
+	s, _ := New("t", "active", "")
+	t1 := time.Unix(100, 0)
+	s.SetContainers([]ContainerStatus{{Name: "a", CheckedAt: t1}, {Name: "b", CheckedAt: t1}, {Name: "c", CheckedAt: t1}})
+	s.RemoveContainer("b")
+	s.RemoveContainer("unknown")
+	got := s.Snapshot().Containers
+	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" || !got[0].CheckedAt.Equal(t1) || !got[1].CheckedAt.Equal(t1) {
+		t.Fatalf("%+v", got)
+	}
+}

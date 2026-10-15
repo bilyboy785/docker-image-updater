@@ -226,6 +226,34 @@ func TestSchedulerSingleTokenPerTrigger(t *testing.T) {
 
 // Targeted scans.
 
+// retryWhileRunning calls trigger until it stops answering AlreadyRunning: the scanning flag drops
+// just before the scheduler marks the scan as finished, so a trigger sent right after the flag may
+// still see the end of the scan.
+func retryWhileRunning(trigger func() TriggerResult) TriggerResult {
+	r := trigger()
+	for i := 0; i < 200 && r.Status == AlreadyRunning; i++ {
+		time.Sleep(5 * time.Millisecond)
+		r = trigger()
+	}
+	return r
+}
+
+// A targeted request accepted while the periodic scan begins is served by that full scan.
+func TestSchedulerPeriodicScanServesAPendingTargetedRequest(t *testing.T) {
+	var full, one int
+	s := NewScheduler(func(context.Context) error { full++; return nil }, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil))).
+		WithContainerRun(func(context.Context, string) error { one++; return nil })
+	if r := s.TriggerContainer("web"); r.Status != Started {
+		t.Fatalf("got %+v", r)
+	}
+	if err := s.scan(context.Background(), request{}); err != nil { // the periodic scan wins the race
+		t.Fatal(err)
+	}
+	if full != 1 || one != 0 || len(s.trigger) != 0 {
+		t.Fatalf("full=%d targeted=%d pending=%d", full, one, len(s.trigger))
+	}
+}
+
 func noValue[T any](t *testing.T, ch <-chan T, what string) {
 	t.Helper()
 	select {
@@ -318,7 +346,7 @@ func TestSchedulerSpacingIsMeasuredFromTheLastStartOfEitherKind(t *testing.T) {
 	waitCh(t, e.scanning, "x")
 	waitCh(t, e.scanning, "x")
 	e.clock.Advance(10 * time.Second) // 10 s after the targeted scan: enough for another targeted one, not for a full one
-	if r := e.s.Trigger(); r.Status != TooSoon || r.RetryAfter != 20*time.Second {
+	if r := retryWhileRunning(e.s.Trigger); r.Status != TooSoon || r.RetryAfter != 20*time.Second {
 		t.Fatalf("a full forced scan keeps its 30 s rule: %+v", r)
 	}
 	e.clock.Advance(20 * time.Second)
@@ -342,7 +370,7 @@ func TestSchedulerFullForcedScanStillResetsTheTimer(t *testing.T) {
 	e.s.TriggerContainer("web")
 	waitCh(t, e.targets, "targeted scan")
 	e.clock.Advance(40 * time.Second)
-	e.s.Trigger()
+	retryWhileRunning(e.s.Trigger)
 	waitCh(t, e.started, "full scan")
 	second := waitCh(t, e.nexts, "full end")
 	if want := first.Add(50 * time.Second); !second.Equal(want) {
@@ -392,7 +420,7 @@ func TestSchedulerTargetedErrorsDoNotStopTheLoop(t *testing.T) {
 	e.s.TriggerContainer("gone")
 	waitCh(t, e.targets, "targeted scan")
 	e.clock.Advance(time.Minute)
-	if r := e.s.Trigger(); r.Status != Started {
+	if r := retryWhileRunning(e.s.Trigger); r.Status != Started {
 		t.Fatalf("got %+v", r)
 	}
 	waitCh(t, e.started, "full scan after a targeted error")

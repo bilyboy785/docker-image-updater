@@ -104,6 +104,22 @@ func TestRunContainerNotFound(t *testing.T) {
 	}
 }
 
+func TestRunContainerNotFoundRemovesTheStaleEntryOnly(t *testing.T) {
+	f := twoContainers()
+	u, _, s := newUpdater(f, false)
+	old := time.Unix(1000, 0)
+	s.SetContainers([]stats.ContainerStatus{
+		{Name: "a", Status: stats.ContainerUpToDate, CheckedAt: old},
+		{Name: "gone", Status: stats.ContainerUpToDate, CheckedAt: old}})
+	if err := u.RunContainer(context.Background(), "gone"); !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("got %v", err)
+	}
+	got := s.Snapshot().Containers
+	if len(got) != 1 || got[0].Name != "a" || !got[0].CheckedAt.Equal(old) || s.Snapshot().Scans != 0 {
+		t.Fatalf("%+v", s.Snapshot())
+	}
+}
+
 func TestRunContainerListFailure(t *testing.T) {
 	f := twoContainers()
 	f.failOn = map[string]error{"List": errors.New("boom")}

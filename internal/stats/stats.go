@@ -194,6 +194,20 @@ func (s *Stats) MergeContainers(entries []ContainerStatus) {
 	s.snap.Containers = merged
 }
 
+// RemoveContainer drops the entry called name from the container list, for a container that no longer
+// exists. Every other entry is kept as it was. It is never persisted.
+func (s *Stats) RemoveContainer(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := make([]ContainerStatus, 0, len(s.snap.Containers))
+	for _, c := range s.snap.Containers {
+		if c.Name != name {
+			kept = append(kept, c)
+		}
+	}
+	s.snap.Containers = kept
+}
+
 // RecordEvent adds an event to the history (newest first, bounded) and updates the counters.
 func (s *Stats) RecordEvent(e Event) {
 	s.mu.Lock()
