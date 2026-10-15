@@ -28,16 +28,18 @@ func (c *fakeClock) Advance(d time.Duration) {
 }
 
 type schedEnv struct {
-	s        *Scheduler
-	clock    *fakeClock
-	started  chan struct{} // one value per scan start
-	release  chan struct{} // one value lets a blocked scan finish
-	block    bool
-	scanning chan bool
-	nexts    chan time.Time
-	runErr   error
-	cancel   context.CancelFunc
-	done     chan struct{}
+	s         *Scheduler
+	clock     *fakeClock
+	started   chan struct{} // one value per scan start
+	release   chan struct{} // one value lets a blocked scan finish
+	block     bool
+	scanning  chan bool
+	nexts     chan time.Time
+	targets   chan string // one value (the container name) per targeted scan start
+	targetErr error
+	runErr    error
+	cancel    context.CancelFunc
+	done      chan struct{}
 }
 
 func newSchedEnv(t *testing.T, interval time.Duration, block bool) *schedEnv {
@@ -54,6 +56,7 @@ func newSchedEnvErr(t *testing.T, interval time.Duration, block bool, runErr err
 		runErr:   runErr,
 		scanning: make(chan bool, 100),
 		nexts:    make(chan time.Time, 100),
+		targets:  make(chan string, 100),
 		done:     make(chan struct{}),
 	}
 	run := func(ctx context.Context) error {
@@ -66,7 +69,18 @@ func newSchedEnvErr(t *testing.T, interval time.Duration, block bool, runErr err
 		}
 		return e.runErr
 	}
+	runOne := func(ctx context.Context, name string) error {
+		e.targets <- name
+		if e.block {
+			select {
+			case <-e.release:
+			case <-ctx.Done():
+			}
+		}
+		return e.targetErr
+	}
 	e.s = NewScheduler(run, interval, slog.New(slog.NewTextHandler(io.Discard, nil))).
+		WithContainerRun(runOne).
 		WithHooks(func(v bool) { e.scanning <- v }, func(next time.Time) { e.nexts <- next })
 	e.s.now = e.clock.Now
 	ctx, cancel := context.WithCancel(context.Background())
@@ -208,4 +222,190 @@ func TestSchedulerSingleTokenPerTrigger(t *testing.T) {
 		t.Fatal("a single trigger must run exactly one scan")
 	case <-time.After(20 * time.Millisecond):
 	}
+}
+
+// Targeted scans.
+
+func noValue[T any](t *testing.T, ch <-chan T, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatalf("unexpected %s", what)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestSchedulerTargetedTriggerRunsTheTargetedScanOnly(t *testing.T) {
+	e := newSchedEnv(t, time.Hour, false)
+	waitCh(t, e.started, "initial scan")
+	waitCh(t, e.nexts, "initial end")
+	e.clock.Advance(10 * time.Second)
+	if r := e.s.TriggerContainer("web"); r.Status != Started {
+		t.Fatalf("got %+v", r)
+	}
+	if got := waitCh(t, e.targets, "targeted scan"); got != "web" {
+		t.Fatalf("got %q", got)
+	}
+	noValue(t, e.started, "full scan")
+}
+
+func TestSchedulerTargetedScanUpdatesTheScanningFlagButNotTheSchedule(t *testing.T) {
+	e := newSchedEnv(t, time.Hour, false)
+	waitCh(t, e.started, "initial scan")
+	waitCh(t, e.nexts, "initial end")
+	for i := 0; i < 2; i++ { // initial scan: true then false
+		waitCh(t, e.scanning, "initial flag")
+	}
+	e.clock.Advance(10 * time.Second)
+	e.s.TriggerContainer("web")
+	waitCh(t, e.targets, "targeted scan")
+	if v := waitCh(t, e.scanning, "flag on"); !v {
+		t.Fatal("scanning must be true during a targeted scan")
+	}
+	if v := waitCh(t, e.scanning, "flag off"); v {
+		t.Fatal("scanning must be false after a targeted scan")
+	}
+	noValue(t, e.nexts, "reschedule after a targeted scan")
+}
+
+func TestSchedulerTargetedScansDoNotPushBackThePeriodicScan(t *testing.T) {
+	e := newSchedEnv(t, 250*time.Millisecond, false)
+	waitCh(t, e.started, "initial scan")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		select {
+		case <-e.started:
+			return // the periodic scan ran although targeted scans kept coming
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the periodic scan was starved by targeted scans")
+		}
+		e.clock.Advance(time.Minute)
+		e.s.TriggerContainer("web")
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
+func TestSchedulerTargetedSpacing(t *testing.T) {
+	e := newSchedEnv(t, time.Hour, false)
+	waitCh(t, e.started, "initial scan")
+	waitCh(t, e.nexts, "initial end")
+	e.clock.Advance(3 * time.Second)
+	r := e.s.TriggerContainer("web")
+	if r.Status != TooSoon || r.RetryAfter != 2*time.Second {
+		t.Fatalf("got %+v", r)
+	}
+	noValue(t, e.targets, "targeted scan")
+	e.clock.Advance(2 * time.Second)
+	if r := e.s.TriggerContainer("web"); r.Status != Started {
+		t.Fatalf("got %+v", r)
+	}
+	waitCh(t, e.targets, "targeted scan")
+}
+
+func TestSchedulerSpacingIsMeasuredFromTheLastStartOfEitherKind(t *testing.T) {
+	e := newSchedEnv(t, time.Hour, false)
+	waitCh(t, e.started, "initial scan")
+	waitCh(t, e.nexts, "initial end")
+	e.clock.Advance(10 * time.Second)
+	if r := e.s.TriggerContainer("web"); r.Status != Started {
+		t.Fatalf("got %+v", r)
+	}
+	waitCh(t, e.targets, "targeted scan")
+	waitCh(t, e.scanning, "x")
+	waitCh(t, e.scanning, "x")
+	waitCh(t, e.scanning, "x")
+	waitCh(t, e.scanning, "x")
+	e.clock.Advance(10 * time.Second) // 10 s after the targeted scan: enough for another targeted one, not for a full one
+	if r := e.s.Trigger(); r.Status != TooSoon || r.RetryAfter != 20*time.Second {
+		t.Fatalf("a full forced scan keeps its 30 s rule: %+v", r)
+	}
+	e.clock.Advance(20 * time.Second)
+	if r := e.s.Trigger(); r.Status != Started {
+		t.Fatalf("got %+v", r)
+	}
+	waitCh(t, e.started, "full scan")
+	// And the other way round: a targeted scan 5 s after a full one is accepted.
+	waitCh(t, e.nexts, "full end")
+	e.clock.Advance(5 * time.Second)
+	if r := e.s.TriggerContainer("web"); r.Status != Started {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+func TestSchedulerFullForcedScanStillResetsTheTimer(t *testing.T) {
+	e := newSchedEnv(t, time.Hour, false)
+	waitCh(t, e.started, "initial scan")
+	first := waitCh(t, e.nexts, "initial end")
+	e.clock.Advance(10 * time.Second)
+	e.s.TriggerContainer("web")
+	waitCh(t, e.targets, "targeted scan")
+	e.clock.Advance(40 * time.Second)
+	e.s.Trigger()
+	waitCh(t, e.started, "full scan")
+	second := waitCh(t, e.nexts, "full end")
+	if want := first.Add(50 * time.Second); !second.Equal(want) {
+		t.Fatalf("got %v want %v", second, want)
+	}
+}
+
+func TestSchedulerAnyRunningScanRejectsTheOtherKind(t *testing.T) {
+	e := newSchedEnv(t, time.Hour, true)
+	waitCh(t, e.started, "initial scan")
+	if r := e.s.TriggerContainer("web"); r.Status != AlreadyRunning {
+		t.Fatalf("got %+v", r)
+	}
+	e.release <- struct{}{}
+	waitCh(t, e.nexts, "end of scan")
+	e.clock.Advance(time.Minute)
+	if r := e.s.TriggerContainer("web"); r.Status != Started {
+		t.Fatalf("got %+v", r)
+	}
+	waitCh(t, e.targets, "targeted scan")
+	if r := e.s.Trigger(); r.Status != AlreadyRunning {
+		t.Fatalf("got %+v", r)
+	}
+	if r := e.s.TriggerContainer("other"); r.Status != AlreadyRunning {
+		t.Fatalf("got %+v", r)
+	}
+	e.release <- struct{}{}
+}
+
+func TestSchedulerTargetedTriggerRunsExactlyOneScan(t *testing.T) {
+	e := newSchedEnv(t, time.Hour, false)
+	waitCh(t, e.started, "initial scan")
+	waitCh(t, e.nexts, "initial end")
+	e.clock.Advance(time.Minute)
+	e.s.TriggerContainer("web")
+	waitCh(t, e.targets, "targeted scan")
+	noValue(t, e.targets, "second targeted scan")
+	noValue(t, e.started, "full scan")
+}
+
+func TestSchedulerTargetedErrorsDoNotStopTheLoop(t *testing.T) {
+	e := newSchedEnv(t, time.Hour, false)
+	e.targetErr = ErrContainerNotFound
+	waitCh(t, e.started, "initial scan")
+	waitCh(t, e.nexts, "initial end")
+	e.clock.Advance(time.Minute)
+	e.s.TriggerContainer("gone")
+	waitCh(t, e.targets, "targeted scan")
+	e.clock.Advance(time.Minute)
+	if r := e.s.Trigger(); r.Status != Started {
+		t.Fatalf("got %+v", r)
+	}
+	waitCh(t, e.started, "full scan after a targeted error")
+}
+
+func TestSchedulerCancelDuringTargetedScan(t *testing.T) {
+	e := newSchedEnv(t, time.Hour, true)
+	waitCh(t, e.started, "initial scan")
+	e.release <- struct{}{}
+	waitCh(t, e.nexts, "initial end")
+	e.clock.Advance(time.Minute)
+	e.s.TriggerContainer("web")
+	waitCh(t, e.targets, "targeted scan")
+	e.cancel()
+	waitCh(t, e.done, "Run to return")
 }
