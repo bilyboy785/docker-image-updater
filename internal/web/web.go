@@ -10,7 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/bilyboy785/docker-image-updater/internal/stats"
 )
@@ -31,6 +34,30 @@ const (
 	// ScanTooSoon means the last scan started too recently; see ScanResult.RetryAfter.
 	ScanTooSoon
 )
+
+// ScanRequest is what a manual scan request asks for: every container (zero value), or only the one
+// called Container, which is always the name of a container of the last published list.
+type ScanRequest struct {
+	Container string
+}
+
+// maxContainerName is the longest container name accepted by POST /api/scan.
+const maxContainerName = 255
+
+// validContainerName reports whether v can be a container name: not blank, at most maxContainerName
+// bytes, valid UTF-8, no control character and no slash. It is only a sanity check: the value is then
+// compared as is with the known names, never used otherwise.
+func validContainerName(v string) bool {
+	if strings.TrimSpace(v) == "" || len(v) > maxContainerName || !utf8.ValidString(v) {
+		return false
+	}
+	for _, r := range v {
+		if r == '/' || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
 
 // ScanResult is returned by the trigger passed to Handler. RetryAfter is only used for ScanTooSoon.
 type ScanResult struct {
@@ -88,8 +115,9 @@ func WithClock(now func() time.Time) Option {
 
 // Handler returns the HTTP handler serving the page (/), the JSON statistics (/api/stats), the
 // Prometheus metrics (/metrics), /healthz and POST /api/scan, which asks for an immediate scan
-// through trigger (answers 501 when trigger is nil).
-func Handler(snap func() stats.Snapshot, trigger func() ScanResult, opts ...Option) http.Handler {
+// through trigger (answers 501 when trigger is nil). With ?container=<name> the scan only covers that
+// container, which must be in the container list of snap (404 otherwise, 400 for a malformed name).
+func Handler(snap func() stats.Snapshot, trigger func(ScanRequest) ScanResult, opts ...Option) http.Handler {
 	o := options{now: time.Now}
 	for _, opt := range opts {
 		opt(&o)
@@ -122,10 +150,36 @@ func Handler(snap func() stats.Snapshot, trigger func() ScanResult, opts ...Opti
 			writeError(w, http.StatusNotImplemented, "manual scans are not available")
 			return
 		}
-		res := trigger()
+		var req ScanRequest
+		started := struct {
+			Status    string `json:"status"`
+			Container string `json:"container,omitempty"`
+		}{Status: "started"}
+		query, err := url.ParseQuery(r.URL.RawQuery)
+		values, present := query["container"]
+		if err != nil || (present && (len(values) != 1 || !validContainerName(values[0]))) {
+			writeError(w, http.StatusBadRequest, "invalid container name")
+			return
+		}
+		if present {
+			known := false
+			for _, c := range snap().Containers {
+				if c.Name == values[0] {
+					known = true
+					break
+				}
+			}
+			if !known {
+				writeError(w, http.StatusNotFound, "unknown container")
+				return
+			}
+			req.Container = values[0]
+			started.Container = req.Container
+		}
+		res := trigger(req)
 		switch res.Status {
 		case ScanStarted:
-			writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
+			writeJSON(w, http.StatusAccepted, started)
 		case ScanAlreadyRunning:
 			writeError(w, http.StatusConflict, "scan already running")
 		default:

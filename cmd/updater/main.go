@@ -74,12 +74,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	sched := updater.NewScheduler(u.RunOnce, cfg.Interval, log).WithHooks(st.SetScanning, st.SetNextScan)
+	sched := updater.NewScheduler(u.RunOnce, cfg.Interval, log).WithContainerRun(u.RunContainer).WithHooks(st.SetScanning, st.SetNextScan)
 
 	if cfg.WebEnabled {
 		go func() {
 			log.Info("web server listening", "addr", cfg.WebAddr)
-			if err := web.Serve(ctx, cfg.WebAddr, web.Handler(st.Snapshot, func() web.ScanResult { return triggerScan(sched) }, web.WithHealth(cfg.Interval))); err != nil {
+			if err := web.Serve(ctx, cfg.WebAddr, web.Handler(st.Snapshot, func(r web.ScanRequest) web.ScanResult { return triggerScan(sched, r) }, web.WithHealth(cfg.Interval))); err != nil {
 				log.Error("web server stopped", "error", err)
 			}
 		}()
@@ -134,8 +134,13 @@ func tzUnrecognised(tz, local string) bool {
 }
 
 // triggerScan adapts the scheduler to the web package.
-func triggerScan(s *updater.Scheduler) web.ScanResult {
-	r := s.Trigger()
+func triggerScan(s *updater.Scheduler, req web.ScanRequest) web.ScanResult {
+	var r updater.TriggerResult
+	if req.Container != "" {
+		r = s.TriggerContainer(req.Container)
+	} else {
+		r = s.Trigger()
+	}
 	switch r.Status {
 	case updater.Started:
 		return web.ScanResult{Status: web.ScanStarted}

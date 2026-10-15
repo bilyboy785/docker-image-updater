@@ -138,13 +138,27 @@ func TestPageChipsAndLastCheckedAreAccessible(t *testing.T) {
 	}
 }
 
+// scanSnap lists the containers of the last scan: "web", "db" and one with a non-ASCII name.
+func scanSnap() stats.Snapshot {
+	s := testSnap()
+	s.Containers = []stats.ContainerStatus{{Name: "db"}, {Name: "web"}, {Name: "café"}}
+	return s
+}
+
+var lastScanRequest ScanRequest
+
 func scanHandler(res ScanResult) (http.Handler, *int) {
 	calls := 0
-	return Handler(testSnap, func() ScanResult { calls++; return res }), &calls
+	lastScanRequest = ScanRequest{}
+	return Handler(scanSnap, func(r ScanRequest) ScanResult { calls++; lastScanRequest = r; return res }), &calls
 }
 
 func post(h http.Handler, headers map[string]string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest("POST", "http://example.test:8080/api/scan", strings.NewReader(`{"ignored":true}`))
+	return postTo(h, "/api/scan", headers)
+}
+
+func postTo(h http.Handler, path string, headers map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("POST", "http://example.test:8080"+path, strings.NewReader(`{"ignored":true}`))
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -257,5 +271,116 @@ func TestPageHasScanButton(t *testing.T) {
 		if !strings.Contains(string(indexHTML), want) {
 			t.Errorf("index.html lacks %q", want)
 		}
+	}
+}
+
+func TestFullScanRequestHasNoContainer(t *testing.T) {
+	h, _ := scanHandler(ScanResult{Status: ScanStarted})
+	post(h, csrfHeader)
+	if lastScanRequest != (ScanRequest{}) {
+		t.Fatalf("%+v", lastScanRequest)
+	}
+}
+
+func TestScanContainerStarted(t *testing.T) {
+	for name, query := range map[string]string{"web": "web", "café": "caf%C3%A9"} {
+		h, calls := scanHandler(ScanResult{Status: ScanStarted})
+		rec := postTo(h, "/api/scan?container="+query, csrfHeader)
+		want := `{"status":"started","container":"` + name + `"}`
+		if rec.Code != 202 || strings.TrimSpace(rec.Body.String()) != want {
+			t.Fatalf("%d %q, want %s", rec.Code, rec.Body.String(), want)
+		}
+		if *calls != 1 || lastScanRequest.Container != name {
+			t.Fatalf("calls=%d request=%+v", *calls, lastScanRequest)
+		}
+	}
+}
+
+func TestScanContainerUnknownIs404(t *testing.T) {
+	for _, q := range []string{"nope", "WEB", "web%20", "%20web", "we", "web.", "caf%C3%A9%20"} {
+		h, calls := scanHandler(ScanResult{Status: ScanStarted})
+		rec := postTo(h, "/api/scan?container="+q, csrfHeader)
+		if rec.Code != 404 || errBody(t, rec) == "" || *calls != 0 {
+			t.Fatalf("%q: %d %q calls=%d", q, rec.Code, rec.Body.String(), *calls)
+		}
+	}
+}
+
+func TestScanContainerMalformedIs400(t *testing.T) {
+	cases := map[string]string{
+		"empty":             "",
+		"blank":             "%20%20",
+		"slash":             "a%2Fb",
+		"nul":               "a%00b",
+		"newline":           "a%0Ab",
+		"tab":               "a%09b",
+		"del":               "a%7Fb",
+		"c1 control":        "a%C2%85b",
+		"too long":          strings.Repeat("a", 256),
+		"invalid utf-8":     "a%FFb",
+		"two values":        "web&container=db",
+		"bad percent":       "a%zzb",
+		"empty with others": "&container=web",
+	}
+	for name, q := range cases {
+		t.Run(name, func(t *testing.T) {
+			h, calls := scanHandler(ScanResult{Status: ScanStarted})
+			rec := postTo(h, "/api/scan?container="+q, csrfHeader)
+			if rec.Code != 400 || errBody(t, rec) == "" || *calls != 0 {
+				t.Fatalf("%d %q calls=%d", rec.Code, rec.Body.String(), *calls)
+			}
+		})
+	}
+}
+
+func TestScanContainerMaxLengthNameIsAccepted(t *testing.T) {
+	name := strings.Repeat("a", 255)
+	snap := func() stats.Snapshot { return stats.Snapshot{Containers: []stats.ContainerStatus{{Name: name}}} }
+	calls := 0
+	h := Handler(snap, func(ScanRequest) ScanResult { calls++; return ScanResult{Status: ScanStarted} })
+	rec := postTo(h, "/api/scan?container="+name, csrfHeader)
+	if rec.Code != 202 || calls != 1 {
+		t.Fatalf("%d calls=%d", rec.Code, calls)
+	}
+}
+
+func TestScanContainerGuardsApplyToo(t *testing.T) {
+	h, calls := scanHandler(ScanResult{Status: ScanStarted})
+	for name, hdr := range map[string]map[string]string{
+		"no header":      {},
+		"foreign origin": {"X-Requested-With": "docker-image-updater", "Origin": "http://evil.test"},
+	} {
+		rec := postTo(h, "/api/scan?container=web", hdr)
+		if rec.Code != 403 || *calls != 0 {
+			t.Fatalf("%s: %d calls=%d", name, rec.Code, *calls)
+		}
+	}
+	// the guards come before the parameter checks
+	if rec := postTo(h, "/api/scan?container=a%2Fb", map[string]string{}); rec.Code != 403 {
+		t.Fatalf("%d", rec.Code)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/scan?container=web", nil))
+	if rec.Code != 405 || *calls != 0 {
+		t.Fatalf("%d calls=%d", rec.Code, *calls)
+	}
+}
+
+func TestScanContainerConflictAndTooSoon(t *testing.T) {
+	h, _ := scanHandler(ScanResult{Status: ScanAlreadyRunning})
+	if rec := postTo(h, "/api/scan?container=web", csrfHeader); rec.Code != 409 || errBody(t, rec) != "scan already running" {
+		t.Fatalf("%d %q", rec.Code, rec.Body.String())
+	}
+	h, _ = scanHandler(ScanResult{Status: ScanTooSoon, RetryAfter: 2200 * time.Millisecond})
+	rec := postTo(h, "/api/scan?container=web", csrfHeader)
+	if rec.Code != 429 || rec.Header().Get("Retry-After") != "3" || errBody(t, rec) == "" {
+		t.Fatalf("%d %q %v", rec.Code, rec.Body.String(), rec.Header())
+	}
+}
+
+func TestScanContainerWithoutTrigger(t *testing.T) {
+	rec := postTo(Handler(scanSnap, nil), "/api/scan?container=web", csrfHeader)
+	if rec.Code != 501 {
+		t.Fatalf("%d", rec.Code)
 	}
 }
