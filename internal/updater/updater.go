@@ -73,8 +73,12 @@ type Updater struct {
 	hnow       func() time.Time
 	hsleep     func(ctx context.Context, d time.Duration)
 
-	report map[string]stats.ContainerStatus // per-scan container list, by container name
+	report  map[string]stats.ContainerStatus // per-scan container list, by container name
+	partial bool                             // the current scan covers a single container: its report is merged into the published list
 }
+
+// ErrContainerNotFound is returned by RunContainer when no running container has the requested name.
+var ErrContainerNotFound = errors.New("container not found")
 
 // New returns an Updater. selfID is the updater's own container id or hostname, used to
 // recognise (and never recreate) its own container.
@@ -151,8 +155,17 @@ func (u *Updater) note(c docker.Container, ref, status, detail string) {
 	}
 }
 
-// publishReport hands the container list of the scan to the stats store.
+// publishReport hands the container list of the scan to the stats store. The report of a scan of a
+// single container is merged into the published list, which keeps every other entry as it was.
 func (u *Updater) publishReport() {
+	if u.partial {
+		list := make([]stats.ContainerStatus, 0, len(u.report))
+		for _, e := range u.report {
+			list = append(list, e)
+		}
+		u.stats.MergeContainers(list)
+		return
+	}
 	list := make([]stats.ContainerStatus, 0, len(u.report))
 	for _, e := range u.report {
 		list = append(list, e)
@@ -162,7 +175,22 @@ func (u *Updater) publishReport() {
 
 // RunOnce performs one full scan.
 func (u *Updater) RunOnce(ctx context.Context) error {
+	return u.scan(ctx, "", false)
+}
+
+// RunContainer scans the running container called name and nothing else: the same checks, pull, policies,
+// update, health gate and notifications as a full scan, but no other container is looked at. Its entry
+// replaces the previous one in the published container list, the other entries are kept as they were, and the
+// watched/skipped gauges are not changed. ErrContainerNotFound is returned, and nothing is published, when no
+// running container has that name.
+func (u *Updater) RunContainer(ctx context.Context, name string) error {
+	return u.scan(ctx, name, true)
+}
+
+// scan lists the running containers and checks them all, or only the one called only when partial is set.
+func (u *Updater) scan(ctx context.Context, only string, partial bool) error {
 	start := time.Now()
+	u.partial = partial
 	u.report = map[string]stats.ContainerStatus{}
 	lctx, lcancel := context.WithTimeout(ctx, u.apiTimeout)
 	containers, err := u.docker.ListContainers(lctx)
@@ -171,6 +199,19 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("list containers: %w", err)
 	}
 	u.touch() // only a scan that can reach the daemon makes progress
+	all := containers
+	if partial {
+		containers = nil
+		for _, c := range all {
+			if c.Name() == only {
+				containers = []docker.Container{c}
+				break
+			}
+		}
+		if containers == nil {
+			return fmt.Errorf("%w: %q", ErrContainerNotFound, only)
+		}
+	}
 	groups := map[string][]docker.Container{}
 	var refs []string
 	watched, skipped := 0, 0
@@ -212,14 +253,18 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 		if ctx.Err() != nil {
 			break
 		}
-		n := u.checkImage(ctx, ref, groups[ref], containers)
+		n := u.checkImage(ctx, ref, groups[ref], all)
 		watched -= n
 		skipped += n
 	}
 	// Published before the scan is recorded, so that whoever sees the scan counted also sees its list;
 	// also when the scan was interrupted: publish what is known.
 	u.publishReport()
-	u.stats.RecordScan(start, time.Since(start), watched, skipped)
+	if partial {
+		u.stats.RecordPartialScan(start, time.Since(start))
+	} else {
+		u.stats.RecordScan(start, time.Since(start), watched, skipped)
+	}
 	return ctx.Err()
 }
 

@@ -252,3 +252,60 @@ func TestTouchRecordsProgressAndIsNotPersisted(t *testing.T) {
 		t.Fatal("saving must not clear the live value")
 	}
 }
+
+func TestMergeContainersReplacesOnlyTheGivenEntriesAndKeepsTheOrder(t *testing.T) {
+	s, _ := New("t", "active", "")
+	t1 := time.Unix(100, 0)
+	t2 := time.Unix(200, 0)
+	s.SetContainers([]ContainerStatus{
+		{Name: "c", Status: ContainerUpToDate, CheckedAt: t1},
+		{Name: "a", Status: ContainerUpToDate, CheckedAt: t1},
+		{Name: "b", Status: ContainerUpToDate, CheckedAt: t1},
+	})
+	s.MergeContainers([]ContainerStatus{{Name: "b", Status: ContainerUpdated, CheckedAt: t2}})
+	got := s.Snapshot().Containers
+	if len(got) != 3 || got[0].Name != "a" || got[1].Name != "b" || got[2].Name != "c" {
+		t.Fatalf("%+v", got)
+	}
+	if got[1].Status != ContainerUpdated || !got[1].CheckedAt.Equal(t2) {
+		t.Fatalf("b not replaced: %+v", got[1])
+	}
+	for _, i := range []int{0, 2} {
+		if got[i].Status != ContainerUpToDate || !got[i].CheckedAt.Equal(t1) {
+			t.Fatalf("entry %d must be untouched: %+v", i, got[i])
+		}
+	}
+}
+
+func TestMergeContainersAddsAnUnknownEntryInSortedPlace(t *testing.T) {
+	s, _ := New("t", "active", "")
+	s.SetContainers([]ContainerStatus{{Name: "a"}, {Name: "c"}})
+	s.MergeContainers([]ContainerStatus{{Name: "b"}})
+	got := s.Snapshot().Containers
+	if len(got) != 3 || got[1].Name != "b" {
+		t.Fatalf("%+v", got)
+	}
+}
+
+func TestMergeContainersWithNothingChangesNothing(t *testing.T) {
+	s, _ := New("t", "active", "")
+	s.SetContainers([]ContainerStatus{{Name: "a"}})
+	s.MergeContainers(nil)
+	if got := s.Snapshot().Containers; len(got) != 1 {
+		t.Fatalf("%+v", got)
+	}
+}
+
+func TestRecordPartialScanCountsTheScanButKeepsTheGauges(t *testing.T) {
+	s, _ := New("t", "active", "")
+	s.RecordScan(time.Unix(1, 0), time.Second, 5, 2)
+	start := time.Unix(50, 0)
+	s.RecordPartialScan(start, 1500*time.Millisecond)
+	snap := s.Snapshot()
+	if snap.Scans != 2 || !snap.LastScan.Equal(start) || snap.LastScanMs != 1500 {
+		t.Fatalf("%+v", snap)
+	}
+	if snap.Watched != 5 || snap.Skipped != 2 {
+		t.Fatalf("gauges must not be overwritten: %+v", snap)
+	}
+}

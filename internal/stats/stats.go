@@ -129,6 +129,18 @@ func (s *Stats) RecordScan(start time.Time, d time.Duration, watched, skipped in
 	s.saveLocked()
 }
 
+// RecordPartialScan records a finished scan of a single container: like RecordScan it counts the scan
+// and records its start and duration, but the watched and skipped gauges describe the whole host and a
+// partial view must not overwrite them, so they keep their previous values.
+func (s *Stats) RecordPartialScan(start time.Time, d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap.Scans++
+	s.snap.LastScan = start
+	s.snap.LastScanMs = d.Milliseconds()
+	s.saveLocked()
+}
+
 // Touch records that the scan just made progress (a pull, an inspection, a container step), so
 // that a long scan that keeps working is not mistaken for a stuck one. It is never persisted.
 func (s *Stats) Touch() {
@@ -158,6 +170,28 @@ func (s *Stats) SetContainers(list []ContainerStatus) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.snap.Containers = cp
+}
+
+// MergeContainers replaces (or adds), by name, the given entries of the container list and keeps every
+// other entry untouched, checked_at included. The list stays sorted by name. It is never persisted.
+func (s *Stats) MergeContainers(entries []ContainerStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	merged := append([]ContainerStatus{}, s.snap.Containers...)
+	for _, e := range entries {
+		replaced := false
+		for i := range merged {
+			if merged[i].Name == e.Name {
+				merged[i], replaced = e, true
+				break
+			}
+		}
+		if !replaced {
+			merged = append(merged, e)
+		}
+	}
+	sort.SliceStable(merged, func(i, j int) bool { return merged[i].Name < merged[j].Name })
+	s.snap.Containers = merged
 }
 
 // RecordEvent adds an event to the history (newest first, bounded) and updates the counters.
