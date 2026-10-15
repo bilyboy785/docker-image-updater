@@ -413,12 +413,12 @@ Behind a reverse proxy, the proxy must forward the original `Host` header, becau
 
 ### Scanning one container
 
-Every row of the container table has a **Scan** button (column **Action**) that scans that container only. The buttons are disabled while any scan runs. The updater's own row and the skipped rows have the button too: scanning them is harmless (the updater only announces a newer image of itself, a skipped container only shows again why it is skipped). The API equivalent takes the container name, URL-encoded, in the `container` parameter:
+Every row of the container table has a **Scan** button (column **Action**) that scans that container only. The buttons are disabled while any scan runs. The updater's own row and the skipped rows have the button too: scanning them is harmless (the updater only announces a newer image of itself, a skipped container only shows again why it is skipped). The API equivalent takes the container name in the `container` parameter (names are made of letters, digits, `_`, `.` and `-`, so they rarely need URL-encoding):
 
 ```bash
 curl -X POST -H 'X-Requested-With: docker-image-updater' 'http://127.0.0.1:8080/api/scan?container=my-app'
-# a name with special characters must be percent-encoded
-curl -X POST -H 'X-Requested-With: docker-image-updater' --get --data-urlencode 'container=my app' http://127.0.0.1:8080/api/scan
+# container names rarely need encoding; this is only a precaution
+curl -X POST -H 'X-Requested-With: docker-image-updater' --get --data-urlencode 'container=my-app_1.web' http://127.0.0.1:8080/api/scan
 ```
 
 Without the parameter the call is the full scan described above. The answer is `202` with `{"status":"started","container":"my-app"}`. The guards of the full scan apply (header, `Origin`, `POST` only, `409` while a scan runs), plus:
@@ -426,7 +426,7 @@ Without the parameter the call is the full scan described above. The answer is `
 - the name must be the name of a container of the last published container list, compared as is: `404` otherwise (the page then asks you to refresh it). A malformed name (empty or blank, longer than 255 bytes, invalid UTF-8, a control character or `/`, or several `container` parameters) is a `400`;
 - a targeted scan is refused with `429` and a `Retry-After` header when the last scan, of either kind, started less than 5 seconds ago. A full forced scan keeps its 30 seconds, also measured from the start of the last scan of either kind, so the stricter limit of the requested kind applies.
 
-The targeted scan runs exactly the same checks as a full scan for that container, and nothing for the others (no pull, no inspection): opt-out, digest, locally built image, `policy=notify`, update windows (a container outside its window is **not** updated: its row says `waiting-window`), invalid labels, `AutoRemove`, dry-run, the health gate with rollback and the memory of images that failed it (shared with the full scans), image cleanup, notifications and events. If the container disappeared since the last scan, nothing happens (it is logged, not notified) and the next full scan refreshes the list.
+The targeted scan runs exactly the same checks as a full scan for that container, and nothing for the others (no pull, no inspection): opt-out, digest, locally built image, `policy=notify`, update windows (a container outside its window is **not** updated: its row says `waiting-window`), invalid labels, `AutoRemove`, dry-run, the health gate with rollback and the memory of images that failed it (shared with the full scans), image cleanup, notifications and events. If the container disappeared since the last scan, nothing is scanned (it is logged, not notified) and its row is removed from the list, so it cannot be clicked again.
 
 A targeted scan counts in `scans`, `last_scan` and the duration, but it does not move the periodic schedule (a full forced scan does), and it replaces only the entry of that container in the container list: the other entries keep their status and their last check time. The `watched` and `skipped` gauges describe whole scans and keep their previous values after a targeted scan.
 
