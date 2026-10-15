@@ -420,3 +420,11 @@ func TestValidContainerWithUnrelatedMalformedParameterIsAccepted(t *testing.T) {
 		t.Fatalf("%d calls=%d %+v", rec.Code, *calls, lastScanRequest)
 	}
 }
+func TestPageRestoresFocusAfterAScan(t *testing.T) {
+	page := string(indexHTML)
+	for _, want := range []string{"lastTarget", ".focus()"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html lacks %q", want)
+		}
+	}
+}

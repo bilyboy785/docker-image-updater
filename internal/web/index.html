@@ -235,12 +235,24 @@ function render(s) {
 
 let timer = null, scanning = false, posting = false, awaitStart = 0, inflight = false;
 const isBusy = () => scanning || posting || awaitStart > 0;
+// lastTarget is the button the user last pressed: {name} for a row, {} for "Scan now". A disabled button
+// loses the keyboard focus, so it is given back to that button once the scan is over.
+let lastTarget = null, wasBusy = false;
+const restoreFocus = () => {
+  const a = document.activeElement;
+  if (!lastTarget || (a && a !== document.body)) return;
+  let btn = lastTarget.name === undefined ? $('scan') : null;
+  if (!btn) for (const b of document.querySelectorAll('button.rowscan')) if (b.dataset.scan === lastTarget.name) btn = b;
+  if (btn && !btn.disabled) btn.focus();
+};
 const setButton = () => {
   const busy = isBusy();
   const btn = $('scan');
   btn.disabled = busy;
   btn.textContent = busy ? 'Scanning…' : 'Scan now';
   for (const b of document.querySelectorAll('button.rowscan')) b.disabled = busy;
+  if (wasBusy && !busy) { restoreFocus(); lastTarget = null; }
+  wasBusy = busy;
 };
 const schedule = ms => { clearTimeout(timer); timer = setTimeout(refresh, ms); };
 
@@ -280,7 +292,7 @@ const SCAN_MESSAGES = {
 // scanNow starts a scan of every container, or only of the container called name.
 async function scanNow(name) {
   if (posting || isBusy()) return;
-  posting = true; setButton();
+  lastTarget = {name}; posting = true; setButton();
   $('scanmsg').textContent = '';
   try {
     const r = await fetch(name === undefined ? '/api/scan' : '/api/scan?container=' + encodeURIComponent(name), {method: 'POST', headers: {'X-Requested-With': 'docker-image-updater'}});
