@@ -15,7 +15,7 @@ Keeps your running Docker containers up to date: it pulls fresh images on a sche
 - Periodic check, with the interval set in minutes.
 - Private registry support (GHCR, Docker Hub, self-hosted) through a mounted Docker config file.
 - Telegram notifications (optional).
-- Optional statistics dashboard with the status of every container and a button to force a scan.
+- Optional statistics dashboard with the status of every container and buttons to force a scan, of everything or of a single container.
 - Prometheus metrics (`/metrics`), a liveness endpoint (`/healthz`) and a built-in image `HEALTHCHECK`.
 - Per-container opt-out label, update policy (`auto` or `notify`) and update time windows.
 - Locally built images are ignored silently.
@@ -317,11 +317,11 @@ Set `WEB_ENABLED=true` to start a small web server (address set by `WEB_ADDR`, `
 | `/api/stats`  | The same statistics as JSON, including the container list (`containers`). |
 | `/metrics`    | Prometheus metrics (see [Metrics](#metrics)). |
 | `/healthz`    | `200 ok` while the scan loop is alive, `503 stale: ...` otherwise (see [Health endpoint and image healthcheck](#health-endpoint-and-image-healthcheck)). |
-| `POST /api/scan` | Starts an immediate scan (see below). |
+| `POST /api/scan` | Starts an immediate scan, of every container or of one (`?container=<name>`, see below). |
 
 ### Container list
 
-The **Containers** section of the page, and the `containers` array of `/api/stats`, show what the last scan found about every running container, with one entry per container name. Chips above the table filter by status (click a chip again to clear the filter). The list is rebuilt by each scan and is not saved in the state file, so it is empty until the first scan after a start.
+The **Containers** section of the page, and the `containers` array of `/api/stats`, show what the last scan found about every running container, with one entry per container name. Chips above the table filter by status (click a chip again to clear the filter). The list is rebuilt by each full scan (a scan of a single container only replaces its own entry, see [Scanning one container](#scanning-one-container)) and is not saved in the state file, so it is empty until the first scan after a start.
 
 | Status             | Meaning |
 |--------------------|---------|
@@ -410,6 +410,25 @@ The call returns immediately with `202` and `{"status":"started"}`. A forced sca
 **The dashboard has no authentication** (neither has `/metrics`, `/api/stats` nor `/healthz`). Bind it to `127.0.0.1` (for example `127.0.0.1:8080:8080` in the port mapping) or put it behind a reverse proxy that handles access control. The dashboard is no longer strictly read-only: anyone who can reach it can force a scan. This does nothing the schedule would not do anyway, but there is still no authentication, so keep it on a private network or behind a reverse proxy. The header and `Origin` checks do not protect against DNS rebinding: rely on network isolation and do not expose the port to untrusted networks.
 
 Behind a reverse proxy, the proxy must forward the original `Host` header, because the `Origin` of the page is compared with it. With nginx add `proxy_set_header Host $host;` (the `proxy_pass` default sends the upstream host); Traefik and Caddy do it by default. Otherwise "Scan now" fails with HTTP 403.
+
+### Scanning one container
+
+Every row of the container table has a **Scan** button (column **Action**) that scans that container only. The buttons are disabled while any scan runs. The updater's own row and the skipped rows have the button too: scanning them is harmless (the updater only announces a newer image of itself, a skipped container only shows again why it is skipped). The API equivalent takes the container name, URL-encoded, in the `container` parameter:
+
+```bash
+curl -X POST -H 'X-Requested-With: docker-image-updater' 'http://127.0.0.1:8080/api/scan?container=my-app'
+# a name with special characters must be percent-encoded
+curl -X POST -H 'X-Requested-With: docker-image-updater' --get --data-urlencode 'container=my app' http://127.0.0.1:8080/api/scan
+```
+
+Without the parameter the call is the full scan described above. The answer is `202` with `{"status":"started","container":"my-app"}`. The guards of the full scan apply (header, `Origin`, `POST` only, `409` while a scan runs), plus:
+
+- the name must be the name of a container of the last published container list, compared as is: `404` otherwise (the page then asks you to refresh it). A malformed name (empty or blank, longer than 255 bytes, invalid UTF-8, a control character or `/`, or several `container` parameters) is a `400`;
+- a targeted scan is refused with `429` and a `Retry-After` header when the last scan, of either kind, started less than 5 seconds ago. A full forced scan keeps its 30 seconds, also measured from the start of the last scan of either kind, so the stricter limit of the requested kind applies.
+
+The targeted scan runs exactly the same checks as a full scan for that container, and nothing for the others (no pull, no inspection): opt-out, digest, locally built image, `policy=notify`, update windows (a container outside its window is **not** updated: its row says `waiting-window`), invalid labels, `AutoRemove`, dry-run, the health gate with rollback and the memory of images that failed it (shared with the full scans), image cleanup, notifications and events. If the container disappeared since the last scan, nothing happens (it is logged, not notified) and the next full scan refreshes the list.
+
+A targeted scan counts in `scans`, `last_scan` and the duration, but it does not move the periodic schedule (a full forced scan does), and it replaces only the entry of that container in the container list: the other entries keep their status and their last check time. The `watched` and `skipped` gauges describe whole scans and keep their previous values after a targeted scan.
 
 ## Security considerations
 
