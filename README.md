@@ -2,11 +2,8 @@
 
 Keeps your running Docker containers up to date: it pulls fresh images on a schedule and recreates the containers that changed.
 
-[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/bilyboy785/docker-image-updater/ci.yml)](https://github.com/bilyboy785/docker-image-updater/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/bilyboy785/docker-image-updater)](https://github.com/bilyboy785/docker-image-updater/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Image](https://img.shields.io/badge/ghcr.io-docker--image--updater-informational)](https://github.com/bilyboy785/docker-image-updater/pkgs/container/docker-image-updater)
-[![Image size](https://ghcr-badge.egpl.dev/bilyboy785/docker-image-updater/size)](https://github.com/bilyboy785/docker-image-updater/pkgs/container/docker-image-updater)
 
 ## Features
 
@@ -36,7 +33,7 @@ docker run -d --name docker-image-updater --restart unless-stopped --stop-timeou
   -v updater-data:/data \
   -e CHECK_INTERVAL_MINUTES=60 \
   -e STATE_FILE=/data/state.json \
-  ghcr.io/bilyboy785/docker-image-updater:latest
+  registry.bldwebagency.fr/docker-image-updater:latest
 ```
 
 With Docker Compose:
@@ -44,7 +41,7 @@ With Docker Compose:
 ```yaml
 services:
   docker-image-updater:
-    image: ghcr.io/bilyboy785/docker-image-updater:latest
+    image: registry.bldwebagency.fr/docker-image-updater:latest
     restart: unless-stopped
     stop_grace_period: 90s   # the update in progress (a rollback takes up to about 60 s) and the notification flush (up to 10 s) must fit (docker stop waits 10 s by default)
     volumes:
@@ -191,7 +188,7 @@ docker run -d --name docker-image-updater --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /path/to/dockerconfig:/config:ro \
   -e DOCKER_CONFIG=/config \
-  ghcr.io/bilyboy785/docker-image-updater:latest
+  registry.bldwebagency.fr/docker-image-updater:latest
 ```
 
 Example `config.json`, with an entry for GitHub Container Registry and one for Docker Hub:
@@ -266,7 +263,7 @@ services:
     labels:
       docker-image-updater.window: "22:00-24:00,00:00-02:00,12:00-13:00"   # several ranges; 24:00 is allowed as an end
   updater:
-    image: ghcr.io/bilyboy785/docker-image-updater:latest
+    image: registry.bldwebagency.fr/docker-image-updater:latest
     environment:
       TZ: Europe/Paris   # windows are evaluated in this zone, UTC when unset
 ```
@@ -378,7 +375,7 @@ The image `HEALTHCHECK` reads environment variables only, never command-line fla
 ```yaml
 services:
   docker-image-updater:
-    image: ghcr.io/bilyboy785/docker-image-updater:latest
+    image: registry.bldwebagency.fr/docker-image-updater:latest
     command: ["-web", "true", "-web-addr", ":9090"]
     healthcheck:
       test: ["CMD", "/docker-image-updater", "-healthcheck", "-web", "true", "-web-addr", ":9090"]
@@ -436,29 +433,7 @@ A targeted scan counts in `scans`, `last_scan` and the duration, but it does not
 - Because of this, the image runs as root.
 - Keep the web port private (see above).
 
-### Verifying images
-
-Release images are signed with [cosign](https://github.com/sigstore/cosign) (keyless, through GitHub's OIDC identity) and ship with a build provenance and an SBOM. Signing starts with v1.2.0: images up to and including v1.1.0 are not signed.
-
-Verify the signature of a tag (the image tags have no `v` prefix; replace `1.2.0` with the version you run):
-
-```bash
-cosign verify \
-  --certificate-identity-regexp '^https://github\.com/bilyboy785/docker-image-updater/\.github/workflows/release\.yml@refs/tags/.*$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/bilyboy785/docker-image-updater:1.2.0
-```
-
-The signature is attached to the image digest, so it is valid for every tag that points to it. Pin the digest in your Compose file if you want the exact image you verified.
-
-The provenance and the SBOM are attached by BuildKit as attestations of the image index (they are not cosign attestations, so `cosign verify-attestation` and `cosign download sbom` do not apply). Inspect them with:
-
-```bash
-docker buildx imagetools inspect ghcr.io/bilyboy785/docker-image-updater:1.2.0 --format '{{ json .SBOM }}'
-docker buildx imagetools inspect ghcr.io/bilyboy785/docker-image-updater:1.2.0 --format '{{ json .Provenance }}'
-```
-
-The Dockerfile base image and every GitHub Action are pinned by digest or commit SHA, and Dependabot proposes weekly updates for them. CI also runs [govulncheck](https://go.dev/doc/security/vuln/) on every push to `main` and every pull request.
+The Dockerfile base image is pinned by digest and Dependabot proposes weekly updates for it.
 
 ## Limitations
 
@@ -484,7 +459,7 @@ make build                     # build the image as docker-image-updater:dev
 make test-integration          # end-to-end test
 ```
 
-The integration test runs in an isolated `docker:dind` daemon and never touches the containers of your local Docker daemon. Set `DIND_IMAGE` to choose the daemon, for example `make test-integration DIND_IMAGE=docker:29-dind`: `docker:27-dind` (the default) uses the classic image store and `docker:29-dind` the containerd one, and CI runs both. It uses a password-protected local registry, so it also covers private registry credentials. It requires Docker with support for privileged containers.
+The integration test runs in an isolated `docker:dind` daemon and never touches the containers of your local Docker daemon. Set `DIND_IMAGE` to choose the daemon, for example `make test-integration DIND_IMAGE=docker:29-dind`: `docker:27-dind` (the default) uses the classic image store and `docker:29-dind` the containerd one. It uses a password-protected local registry, so it also covers private registry credentials. It requires Docker with support for privileged containers.
 
 Layout:
 
@@ -498,7 +473,7 @@ Layout:
 - `internal/web`: dashboard and API.
 - `test`: integration test.
 
-Every push to `main` and every pull request runs the unit and integration tests. To release, publish a GitHub release for a `v*` tag (for example `gh release create v1.0.0 --generate-notes`): the Release workflow re-runs the tests, then builds and pushes the multi-arch image to `ghcr.io`, signs it and attaches its provenance and SBOM. Pre-releases (for example `v1.1.0-rc1`) do not update `latest`.
+There is no hosted CI. Before each release, `./scripts/publish.sh` runs the unit and integration tests locally in Docker, then builds the `linux/amd64` image and pushes it to `registry.bldwebagency.fr/docker-image-updater` as `latest`, plus the version tag (without the `v` prefix) when HEAD is on a `v*` tag. To release, tag the commit, push the tag, run the script and publish the GitHub release (`gh release create v1.0.0 --generate-notes`).
 
 ## License
 
