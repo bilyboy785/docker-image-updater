@@ -383,3 +383,17 @@ func TestImageRepoTags(t *testing.T) {
 		t.Fatalf("%v %v", tags, err)
 	}
 }
+
+func TestHostName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/info" {
+			t.Errorf("path %s", r.URL.Path)
+		}
+		w.Write([]byte(`{"Name":"web-01","ID":"x"}`))
+	}))
+	defer srv.Close()
+	got, err := NewWithBase(srv.URL, srv.Client()).HostName(context.Background())
+	if err != nil || got != "web-01" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}

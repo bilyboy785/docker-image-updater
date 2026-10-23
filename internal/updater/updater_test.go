@@ -819,3 +819,14 @@ func TestUnauthorizedPullIsReportedOnceWithoutLeakingCredentials(t *testing.T) {
 		}
 	}
 }
+
+func TestNotifyTitleNamesTheHost(t *testing.T) {
+	u, n, _ := newUpdater(&fakeDocker{}, false)
+	u.notify(context.Background(), "single line")
+	u.WithHostName("web<1>")
+	u.notify(context.Background(), "✅ Updated <b>nginx</b>\nImage: x")
+	want := []string{"single line", "✅ Updated <b>nginx</b> on <b>web&lt;1&gt;</b>\nImage: x"}
+	if strings.Join(n.msgs, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %q, want %q", n.msgs, want)
+	}
+}

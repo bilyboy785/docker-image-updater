@@ -86,6 +86,15 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 	return nil
 }
 
+// HostName returns the hostname of the Docker host, as reported by the daemon.
+func (c *Client) HostName(ctx context.Context) (string, error) {
+	var out struct{ Name string }
+	if err := c.do(ctx, "GET", "/info", nil, nil, &out); err != nil {
+		return "", err
+	}
+	return out.Name, nil
+}
+
 // ListContainers returns the running containers.
 func (c *Client) ListContainers(ctx context.Context) ([]Container, error) {
 	var out []Container

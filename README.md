@@ -288,10 +288,10 @@ Details:
 2. Send a message to your new bot (or add it to a group), then open `https://api.telegram.org/bot<your-token>/getUpdates` in a browser and read the `chat.id` value.
 3. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Both must be set together.
 
-Messages are sent as HTML. Example:
+Messages are sent as HTML. The title ends with the hostname of the Docker host (as reported by the daemon, not the updater container's own id). Example:
 
 ```
-✅ Updated nginx
+✅ Updated nginx on myserver
 Image: nginx:latest
 1a2b3c4d5e6f → 7a8b9c0d1e2f
 ```

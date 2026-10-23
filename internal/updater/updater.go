@@ -67,6 +67,8 @@ type Updater struct {
 	apiTimeout  time.Duration
 	pullTimeout time.Duration
 
+	hostName string // hostname of the Docker host, appended to the title of every notification
+
 	cleanupImages bool // remove the previous image after a successful update
 
 	healthWait time.Duration // post-start health gate duration; 0 disables it
@@ -92,6 +94,13 @@ func New(d DockerAPI, n notify.Notifier, s *stats.Stats, selfID string, dryRun b
 // (best effort) and returns the updater.
 func (u *Updater) WithCleanupImages(on bool) *Updater {
 	u.cleanupImages = on
+	return u
+}
+
+// WithHostName sets the hostname of the Docker host, appended to the title (first line) of every
+// notification, and returns the updater. An empty name leaves the notifications unchanged.
+func (u *Updater) WithHostName(h string) *Updater {
+	u.hostName = h
 	return u
 }
 
@@ -597,6 +606,14 @@ func (u *Updater) finish(ctx context.Context, ev stats.Event, ref, status, warn 
 
 // notify sends a message and only logs a failure to do so.
 func (u *Updater) notify(ctx context.Context, text string) {
+	if u.hostName != "" {
+		title, rest, multi := strings.Cut(text, "\n")
+		title += " on <b>" + html.EscapeString(u.hostName) + "</b>"
+		if multi {
+			title += "\n" + rest
+		}
+		text = title
+	}
 	if err := u.notifier.Notify(ctx, text); err != nil {
 		u.log.Warn("notification failed", "error", err)
 	}

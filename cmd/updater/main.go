@@ -66,7 +66,15 @@ func main() {
 
 	host, _ := os.Hostname()
 	creds := registry.NewStore(cfg.DockerConfig, func(msg string) { log.Warn(msg) })
-	u := updater.New(docker.New(cfg.Socket), notifier, st, host, cfg.DryRun, log).WithRegistryAuth(creds).WithHealthWait(cfg.HealthWait).WithCleanupImages(cfg.CleanupImages)
+	dc := docker.New(cfg.Socket)
+	// The container's own hostname is its id: ask the daemon for the hostname of the host.
+	hctx, hcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	hostName, herr := dc.HostName(hctx)
+	hcancel()
+	if herr != nil {
+		log.Warn("docker host name unavailable, notifications will not name the host", "error", herr)
+	}
+	u := updater.New(dc, notifier, st, host, cfg.DryRun, log).WithHostName(hostName).WithRegistryAuth(creds).WithHealthWait(cfg.HealthWait).WithCleanupImages(cfg.CleanupImages)
 	if cfg.DockerConfig != "" {
 		log.Info("registry credentials enabled", "config_dir", cfg.DockerConfig)
 	}
