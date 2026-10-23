@@ -48,7 +48,7 @@ func TestFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock", "/config", true, 45 * time.Second, false}
+	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock", "/config", true, "", 45 * time.Second, false}
 	if c != want {
 		t.Fatalf("got %+v want %+v", c, want)
 	}
@@ -155,5 +155,16 @@ func TestHealthcheckFlag(t *testing.T) {
 	}
 	if !strings.Contains(Usage(), "-healthcheck") {
 		t.Fatal("the flag must be documented in the usage")
+	}
+}
+
+func TestHostNameFlagOverridesEnv(t *testing.T) {
+	c, err := Load([]string{"-host-name", " flag.example.com "}, env(map[string]string{"HOST_NAME": "env.example.com"}))
+	if err != nil || c.HostName != "flag.example.com" {
+		t.Fatalf("flag: got %q, %v", c.HostName, err)
+	}
+	c, err = Load(nil, env(map[string]string{"HOST_NAME": "env.example.com"}))
+	if err != nil || c.HostName != "env.example.com" {
+		t.Fatalf("env: got %q, %v", c.HostName, err)
 	}
 }

@@ -67,12 +67,16 @@ func main() {
 	host, _ := os.Hostname()
 	creds := registry.NewStore(cfg.DockerConfig, func(msg string) { log.Warn(msg) })
 	dc := docker.New(cfg.Socket)
-	// The container's own hostname is its id: ask the daemon for the hostname of the host.
-	hctx, hcancel := context.WithTimeout(context.Background(), 10*time.Second)
-	hostName, herr := dc.HostName(hctx)
-	hcancel()
-	if herr != nil {
-		log.Warn("docker host name unavailable, notifications will not name the host", "error", herr)
+	// The container's own hostname is its id: use HOST_NAME, else ask the daemon for the hostname of the host.
+	hostName := cfg.HostName
+	if hostName == "" {
+		hctx, hcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		var herr error
+		hostName, herr = dc.HostName(hctx)
+		hcancel()
+		if herr != nil {
+			log.Warn("docker host name unavailable, notifications will not name the host (set HOST_NAME to force it)", "error", herr)
+		}
 	}
 	u := updater.New(dc, notifier, st, host, cfg.DryRun, log).WithHostName(hostName).WithRegistryAuth(creds).WithHealthWait(cfg.HealthWait).WithCleanupImages(cfg.CleanupImages)
 	if cfg.DockerConfig != "" {

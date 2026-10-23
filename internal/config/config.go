@@ -22,6 +22,7 @@ type Config struct {
 	Socket        string        // Docker socket path
 	DockerConfig  string        // directory containing the Docker config.json with registry credentials; empty disables it
 	CleanupImages bool          // remove the previous image after a successful update
+	HostName      string        // name of the Docker host shown in notifications; empty asks the Docker daemon
 	HealthWait    time.Duration // how long a new container is observed before the update is accepted; 0 disables the gate
 	HealthCheck   bool          // probe the local web server's /healthz and exit (used by the image HEALTHCHECK)
 }
@@ -42,6 +43,7 @@ const maxHealthWaitSeconds = 600
 // flags holds the parsed values of every setting, before validation.
 type flags struct {
 	interval, token, chat, dry, web, addr, state, sock, dockerCfg, healthWait, cleanup *string
+	hostName                                                                           *string
 	healthcheck                                                                        *bool
 }
 
@@ -59,6 +61,7 @@ func newFlagSet(getenv func(string) string) (*flag.FlagSet, flags) {
 		state:       fs.String("state-file", getenv("STATE_FILE"), "file used to persist statistics (env STATE_FILE)"),
 		sock:        fs.String("socket", envOr(getenv, "DOCKER_SOCKET", "/var/run/docker.sock"), "Docker socket path (env DOCKER_SOCKET)"),
 		dockerCfg:   fs.String("docker-config", getenv("DOCKER_CONFIG"), "directory containing config.json with registry credentials (env DOCKER_CONFIG)"),
+		hostName:    fs.String("host-name", getenv("HOST_NAME"), "host name shown in notifications, for example the full FQDN; defaults to the name reported by the Docker daemon (env HOST_NAME)"),
 		healthWait:  fs.String("health-wait", envOr(getenv, "HEALTH_WAIT_SECONDS", "60"), "seconds a new container is watched before the update is accepted, 0 disables the check, 0 to 600 (env HEALTH_WAIT_SECONDS)"),
 		cleanup:     fs.String("cleanup-images", envOr(getenv, "CLEANUP_IMAGES", "false"), "remove the previous image after a successful update (env CLEANUP_IMAGES)"),
 		healthcheck: fs.Bool("healthcheck", false, "probe the local web server's /healthz, exit 0 when healthy (or when the web server is disabled) and 1 otherwise; used by the image HEALTHCHECK"),
@@ -120,6 +123,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		StateFile:     *state,
 		Socket:        *sock,
 		DockerConfig:  strings.TrimSpace(*dockerCfg),
+		HostName:      strings.TrimSpace(*f.hostName),
 		HealthWait:    time.Duration(wait) * time.Second,
 		CleanupImages: cleanupImages,
 		HealthCheck:   *f.healthcheck,

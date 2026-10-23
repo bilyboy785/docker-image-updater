@@ -98,9 +98,10 @@ func (u *Updater) WithCleanupImages(on bool) *Updater {
 }
 
 // WithHostName sets the hostname of the Docker host, appended to the title (first line) of every
-// notification, and returns the updater. An empty name leaves the notifications unchanged.
+// notification, and returns the updater. The name is lowercased; an empty name leaves the
+// notifications unchanged.
 func (u *Updater) WithHostName(h string) *Updater {
-	u.hostName = h
+	u.hostName = strings.ToLower(strings.TrimSpace(h))
 	return u
 }
 

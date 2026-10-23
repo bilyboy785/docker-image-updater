@@ -77,6 +77,7 @@ Every setting can be given as an environment variable or as a command-line flag.
 | `WEB_ENABLED`            | `-web`             | `false`                 | Enable the statistics web server. |
 | `WEB_ADDR`               | `-web-addr`        | `:8080`                 | Listen address of the web server. |
 | `STATE_FILE`             | `-state-file`      | empty                   | File used to persist statistics across restarts. Statistics are not persisted when empty. |
+| `HOST_NAME`              | `-host-name`       | empty                   | Host name shown in the title of notifications, lowercased. Use it to get the full FQDN. When empty, the name reported by the Docker daemon is used. |
 | `DOCKER_SOCKET`          | `-socket`          | `/var/run/docker.sock`  | Path of the Docker socket. |
 | `HEALTH_WAIT_SECONDS`    | `-health-wait`     | `60`                    | How long a new container is watched before the update is accepted, in seconds (integer from 0 to 600). `0` disables the health gate. See [Health gate](#health-gate). |
 | `CLEANUP_IMAGES`         | `-cleanup-images`  | `false`                 | Remove the previous image after a successful update. See [Cleaning up old images](#cleaning-up-old-images). |
