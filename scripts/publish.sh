@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the tests in Docker, then builds the linux/amd64 image and pushes it to the private registry
+# Runs the tests in Docker, then builds the linux/amd64 + linux/arm64 image and pushes it to the private registry
 # as :latest, plus :<version> when HEAD is on a v* tag (the tag without its `v` prefix).
 #
 #   ./scripts/publish.sh                 # tests + build + push
@@ -11,6 +11,7 @@ cd "$(dirname "$0")/.."
 REGISTRY="${REGISTRY:-registry.bldwebagency.fr}"
 PROJECT="${PROJECT:-docker-image-updater}"
 IMAGE="${REGISTRY}/${PROJECT}"
+PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 
 version=""
 if tag="$(git describe --tags --exact-match --match 'v*' HEAD 2>/dev/null)"; then
@@ -28,7 +29,7 @@ if [[ -n "$version" ]]; then
 fi
 
 docker buildx build \
-  --platform linux/amd64 \
+  --platform "${PLATFORMS}" \
   --build-arg "VERSION=${version:-dev}" \
   --provenance=false \
   "${tags[@]}" \

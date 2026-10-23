@@ -473,7 +473,7 @@ Layout:
 - `internal/web`: dashboard and API.
 - `test`: integration test.
 
-There is no hosted CI. Before each release, `./scripts/publish.sh` runs the unit and integration tests locally in Docker, then builds the `linux/amd64` image and pushes it to `registry.bldwebagency.fr/docker-image-updater` as `latest`, plus the version tag (without the `v` prefix) when HEAD is on a `v*` tag. To release, tag the commit, push the tag, run the script and publish the GitHub release (`gh release create v1.0.0 --generate-notes`).
+There is no hosted CI. Before each release, `./scripts/publish.sh` runs the unit and integration tests locally in Docker, then builds the `linux/amd64` and `linux/arm64` image and pushes it to `registry.bldwebagency.fr/docker-image-updater` as `latest`, plus the version tag (without the `v` prefix) when HEAD is on a `v*` tag. To release, tag the commit, push the tag, run the script and publish the GitHub release (`gh release create v1.0.0 --generate-notes`).
 
 ## License
 
