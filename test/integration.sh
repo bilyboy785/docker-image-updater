@@ -14,6 +14,7 @@ REG_PORT="${REG_PORT:-5005}"
 REG_USER="testuser"
 REG_PASS="testpass"
 WEB_PORT="${WEB_PORT:-18080}"
+UPDATE_TOKEN="${UPDATE_TOKEN:-diu-integration-token-$$}"
 export REF="localhost:${REG_PORT}/diu-test:latest"
 WORK="$(mktemp -d)"
 FAILS=0
@@ -285,7 +286,7 @@ docker run -d --name diu-updater --label docker-image-updater.enable=false \
   -v diu-cfg:/config:ro -e DOCKER_CONFIG=/config \
   -p "${WEB_PORT}:8080" \
   -e CHECK_INTERVAL_MINUTES=60 -e WEB_ENABLED=true \
-  -e HEALTH_WAIT_SECONDS=30 -e CLEANUP_IMAGES=true "$IMAGE" >/dev/null
+  -e HEALTH_WAIT_SECONDS=30 -e CLEANUP_IMAGES=true -e UPDATE_API_TOKEN="$UPDATE_TOKEN" "$IMAGE" >/dev/null
 
 stat() { # name: numeric field of the stats API, whatever the JSON field order
   curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -o "\"$1\":[0-9]*" | head -1 | cut -d: -f2
@@ -599,6 +600,82 @@ assert_eq "updates count after the full scan" "10" "$(stat updates)"
 assert_eq "rollbacks count after the full scan" "2" "$(stat rollbacks)"
 assert_eq "failures count after the full scan" "0" "$(stat failures)"
 assert_eq "no leftover _old container after the full scan" "0" "$(docker ps -a --format '{{.Names}}' | grep -c '_old$' || true)"
+
+echo "==> updating the containers of an image on demand (POST /api/update)"
+UPDATE_URL="http://127.0.0.1:${WEB_PORT}/api/update"
+API_REF="localhost:${REG_PORT}/diu-api:latest"
+publish_image "$API_REF" 1 "$HC_OK"
+docker run -d --name diu-api-auto "$API_REF" >/dev/null
+docker run -d --name diu-api-notify --label docker-image-updater.policy=notify "$API_REF" >/dev/null
+docker run -d --name diu-api-window --label "docker-image-updater.window=$WINDOW" "$API_REF" >/dev/null
+docker run -d --name diu-api-optout --label docker-image-updater.enable=false "$API_REF" >/dev/null
+API_V1="$(docker image inspect -f '{{.Id}}' "$API_REF")"
+API_AUTO_CID="$(docker inspect -f '{{.Id}}' diu-api-auto)"
+API_OPTOUT_CID="$(docker inspect -f '{{.Id}}' diu-api-optout)"
+publish_v2_over_v1 "$API_REF" "$HC_OK"
+assert_eq "the api image tag points at v1 again" "$API_V1" "$(docker image inspect -f '{{.Id}}' "$API_REF")"
+# Another image that also has a new version, but is not the one requested: it must stay untouched.
+CONTROL_CID="$(docker inspect -f '{{.Id}}' diu-clean)"
+publish_next_over_current "$CLEAN_REF" 4 "$HC_OK"
+assert_eq "the control image tag points at v3 again" "$CLEAN_V3" "$(docker image inspect -f '{{.Id}}' "$CLEAN_REF")"
+STATS_API_PRE="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+UPDATES_PRE="$(jnum updates "$STATS_API_PRE")"
+# update_post ARGS...: prints "<http code> <body>".
+update_post() { curl -s -m 5 -w ' %{http_code}' -X POST "$@" || true; }
+assert_match "no token is a 401" ' 401$' "$(update_post "$UPDATE_URL?image=$API_REF" | tr -d '\n')"
+assert_match "a wrong token is a 401" ' 401$' "$(update_post -H 'Authorization: Bearer nope' "$UPDATE_URL?image=$API_REF" | tr -d '\n')"
+assert_match "the token in the query string is not accepted" ' 401$' "$(update_post "$UPDATE_URL?image=$API_REF&token=$UPDATE_TOKEN" | tr -d '\n')"
+assert_match "the scan header is not a credential" ' 401$' "$(update_post -H 'X-Requested-With: docker-image-updater' "$UPDATE_URL?image=$API_REF" | tr -d '\n')"
+assert_match "a malformed image is a 400" ' 400$' "$(update_post -H "Authorization: Bearer $UPDATE_TOKEN" "$UPDATE_URL?image=a%20b" | tr -d '\n')"
+assert_match "a missing image is a 400" ' 400$' "$(update_post -H "Authorization: Bearer $UPDATE_TOKEN" "$UPDATE_URL" | tr -d '\n')"
+assert_match "an image nobody runs is a 404" ' 404$' "$(update_post -H "Authorization: Bearer $UPDATE_TOKEN" "$UPDATE_URL?image=localhost:${REG_PORT}/diu-nothing:1" | tr -d '\n')"
+assert_eq "GET on the update endpoint is not allowed" "405" "$(curl -s -m 3 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $UPDATE_TOKEN" "$UPDATE_URL?image=$API_REF" || true)"
+assert_eq "rejected update requests changed nothing" "$API_V1" "$(docker inspect -f '{{.Image}}' diu-api-auto)"
+UPDATE_OUT="$(update_post -H "Authorization: Bearer $UPDATE_TOKEN" "$UPDATE_URL?image=$API_REF" | tr -d '\n')"
+assert_match "the update request is accepted" ' 202$' "$UPDATE_OUT"
+assert_contains "the answer says it is queued" '"status":"queued"' "$UPDATE_OUT"
+assert_contains "the answer carries the canonical image" "\"image\":\"$API_REF\"" "$UPDATE_OUT"
+for name in diu-api-auto diu-api-notify diu-api-optout diu-api-window; do
+  assert_contains "the answer lists $name" "\"$name\"" "$UPDATE_OUT"
+done
+# Never refused for coming too soon or while the first one runs: a second push is accepted right away.
+assert_match "a second request right after is accepted too" ' 202$' "$(update_post -H "Authorization: Bearer $UPDATE_TOKEN" "$UPDATE_URL?image=$API_REF" | tr -d '\n')"
+api_done=0
+for _ in $(seq 1 180); do
+  if [ "$(docker inspect -f '{{.Image}}' diu-api-window 2>/dev/null || true)" != "$API_V1" ] \
+    && [ "$(docker inspect -f '{{.Image}}' diu-api-notify 2>/dev/null || true)" != "$API_V1" ] \
+    && [ "$(docker inspect -f '{{.Image}}' diu-api-auto 2>/dev/null || true)" != "$API_V1" ] \
+    && grep -q '"scanning":false' <<< "$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"; then api_done=1; break; fi
+  sleep 1
+done
+assert_eq "the requested containers were updated" "1" "$api_done"
+STATS_API_POST="$(curl -sf -m 3 "http://127.0.0.1:${WEB_PORT}/api/stats")"
+API_V2="$(docker image inspect -f '{{.Id}}' "$API_REF")"
+assert_eq "the api image was pulled" "1" "$([ "$API_V2" != "$API_V1" ] && echo 1 || echo 0)"
+for name in diu-api-auto diu-api-notify diu-api-window; do
+  assert_eq "$name runs the new image" "$API_V2" "$(docker inspect -f '{{.Image}}' "$name")"
+  assert_eq "$name runs the new version" "2" "$(docker exec "$name" cat /version)"
+done
+assert_eq "diu-api-auto was recreated" "1" "$([ "$API_AUTO_CID" != "$(docker inspect -f '{{.Id}}' diu-api-auto)" ] && echo 1 || echo 0)"
+# The container list shows the outcome of the latest check (the second request found nothing left to do), the
+# events keep the update itself.
+for name in diu-api-notify diu-api-window; do
+  assert_eq "$name was updated by the explicit request" "1" "$(events_of <<< "$STATS_API_POST" | grep -o "\"container\":\"$name\",\"image\":\"[^\"]*\",\"old_id\":\"[^\"]*\",\"new_id\":\"[^\"]*\",\"status\":\"updated\"" | wc -l | tr -d ' ')"
+  assert_eq "$name has no available event: the policy and the window did not hold the update back" "0" "$(events_of <<< "$STATS_API_POST" | grep -o "\"container\":\"$name\",\"image\":\"[^\"]*\",\"old_id\":\"[^\"]*\",\"new_id\":\"[^\"]*\",\"status\":\"available\"" | wc -l | tr -d ' ')"
+done
+assert_eq "the opt-out label is still respected" "$API_OPTOUT_CID" "$(docker inspect -f '{{.Id}}' diu-api-optout)"
+assert_eq "the opt-out container keeps its image" "$API_V1" "$(docker inspect -f '{{.Image}}' diu-api-optout)"
+assert_eq "the containers of the other image were not touched" "$CONTROL_CID" "$(docker inspect -f '{{.Id}}' diu-clean)"
+assert_eq "the other image was not even pulled" "$CLEAN_V3" "$(docker image inspect -f '{{.Id}}' "$CLEAN_REF")"
+assert_eq "exactly the three requested containers were updated" "$((UPDATES_PRE + 3))" "$(jnum updates "$STATS_API_POST")"
+assert_eq "no rollback after the update request" "2" "$(jnum rollbacks "$STATS_API_POST")"
+assert_eq "no failure after the update request" "0" "$(jnum failures "$STATS_API_POST")"
+assert_eq "the update request does not move the periodic schedule" "$(jstr next_scan "$STATS_API_PRE")" "$(jstr next_scan "$STATS_API_POST")"
+assert_eq "the watched gauge is not overwritten by the image scan" "$(jnum watched "$STATS_API_PRE")" "$(jnum watched "$STATS_API_POST")"
+assert_contains "the request is logged" 'msg="image update requested"' "$(docker logs diu-updater 2>&1)"
+assert_eq "updater logs never contain the update token" "0" "$(docker logs diu-updater 2>&1 | grep -c -F "$UPDATE_TOKEN" || true)"
+assert_eq "stats API never contains the update token" "0" "$(grep -c -F "$UPDATE_TOKEN" <<< "$STATS_API_POST" || true)"
+assert_eq "no leftover _old container after the update request" "0" "$(docker ps -a --format '{{.Names}}' | grep -c '_old$' || true)"
 
 assert_contains "registry credentials enabled at startup" "registry credentials enabled" "$(docker logs diu-updater 2>&1)"
 assert_eq "updater logs never contain the registry password" "0" "$(docker logs diu-updater 2>&1 | grep -c -F "$REG_PASS" || true)"

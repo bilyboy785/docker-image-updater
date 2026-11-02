@@ -36,6 +36,7 @@ type schedEnv struct {
 	scanning  chan bool
 	nexts     chan time.Time
 	targets   chan string // one value (the container name) per targeted scan start
+	images    chan string // one value (the image reference) per image scan start
 	targetErr error
 	runErr    error
 	cancel    context.CancelFunc
@@ -57,6 +58,7 @@ func newSchedEnvErr(t *testing.T, interval time.Duration, block bool, runErr err
 		scanning: make(chan bool, 100),
 		nexts:    make(chan time.Time, 100),
 		targets:  make(chan string, 100),
+		images:   make(chan string, 100),
 		done:     make(chan struct{}),
 	}
 	run := func(ctx context.Context) error {
@@ -79,8 +81,19 @@ func newSchedEnvErr(t *testing.T, interval time.Duration, block bool, runErr err
 		}
 		return e.targetErr
 	}
+	runImage := func(ctx context.Context, ref string) error {
+		e.images <- ref
+		if e.block {
+			select {
+			case <-e.release:
+			case <-ctx.Done():
+			}
+		}
+		return nil
+	}
 	e.s = NewScheduler(run, interval, slog.New(slog.NewTextHandler(io.Discard, nil))).
 		WithContainerRun(runOne).
+		WithImageRun(runImage).
 		WithHooks(func(v bool) { e.scanning <- v }, func(next time.Time) { e.nexts <- next })
 	e.s.now = e.clock.Now
 	ctx, cancel := context.WithCancel(context.Background())

@@ -86,12 +86,24 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	sched := updater.NewScheduler(u.RunOnce, cfg.Interval, log).WithContainerRun(u.RunContainer).WithHooks(st.SetScanning, st.SetNextScan)
+	sched := updater.NewScheduler(u.RunOnce, cfg.Interval, log).WithContainerRun(u.RunContainer).WithImageRun(u.RunImage).WithHooks(st.SetScanning, st.SetNextScan)
 
 	if cfg.WebEnabled {
+		webOpts := []web.Option{web.WithHealth(cfg.Interval)}
+		if cfg.UpdateToken != "" {
+			webOpts = append(webOpts, web.WithUpdateAPI(cfg.UpdateToken, web.UpdateAPI{
+				Containers: u.ContainersOfImage,
+				Request: func(ref string) web.UpdateResult {
+					r := triggerImage(sched, ref)
+					log.Info("image update requested", "image", ref, "accepted", r.Status == web.UpdateQueued)
+					return r
+				},
+			}))
+			log.Info("image update endpoint enabled", "path", "/api/update")
+		}
 		go func() {
 			log.Info("web server listening", "addr", cfg.WebAddr)
-			if err := web.Serve(ctx, cfg.WebAddr, web.Handler(st.Snapshot, func(r web.ScanRequest) web.ScanResult { return triggerScan(sched, r) }, web.WithHealth(cfg.Interval))); err != nil {
+			if err := web.Serve(ctx, cfg.WebAddr, web.Handler(st.Snapshot, func(r web.ScanRequest) web.ScanResult { return triggerScan(sched, r) }, webOpts...)); err != nil {
 				log.Error("web server stopped", "error", err)
 			}
 		}()
@@ -161,4 +173,12 @@ func triggerScan(s *updater.Scheduler, req web.ScanRequest) web.ScanResult {
 	default:
 		return web.ScanResult{Status: web.ScanTooSoon, RetryAfter: r.RetryAfter}
 	}
+}
+
+// triggerImage adapts the scheduler to the web package: ref is queued for an image scan.
+func triggerImage(s *updater.Scheduler, ref string) web.UpdateResult {
+	if s.TriggerImage(ref).Status == updater.QueueFull {
+		return web.UpdateResult{Status: web.UpdateQueueFull}
+	}
+	return web.UpdateResult{Status: web.UpdateQueued}
 }

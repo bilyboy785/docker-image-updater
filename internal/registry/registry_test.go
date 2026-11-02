@@ -301,3 +301,34 @@ func TestOversizedFileIsInvalid(t *testing.T) {
 		t.Fatalf("%v", w.msgs)
 	}
 }
+
+func TestCanonicalRef(t *testing.T) {
+	for in, want := range map[string]string{
+		"nginx":                                  "docker.io/library/nginx:latest",
+		"nginx:1.27":                             "docker.io/library/nginx:1.27",
+		"library/nginx":                          "docker.io/library/nginx:latest",
+		"docker.io/library/nginx:latest":         "docker.io/library/nginx:latest",
+		"index.docker.io/library/nginx":          "docker.io/library/nginx:latest",
+		"registry-1.docker.io/bitnami/redis:7":   "docker.io/bitnami/redis:7",
+		"bitnami/redis":                          "docker.io/bitnami/redis:latest",
+		"Registry.BLDWebAgency.fr/app":           "registry.bldwebagency.fr/app:latest",
+		"registry.bldwebagency.fr/app:v1.2.3":    "registry.bldwebagency.fr/app:v1.2.3",
+		"localhost:5005/diu-test":                "localhost:5005/diu-test:latest",
+		"localhost:5005/diu-test:dev":            "localhost:5005/diu-test:dev",
+		"registry.example.com:5000/team/app/api": "registry.example.com:5000/team/app/api:latest",
+		"  registry.example.com/app:1  ":         "registry.example.com/app:1",
+	} {
+		if got := CanonicalRef(in); got != want {
+			t.Errorf("CanonicalRef(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestCanonicalRefTreatsEquivalentSpellingsAlike(t *testing.T) {
+	if CanonicalRef("nginx") != CanonicalRef("docker.io/library/nginx:latest") {
+		t.Fatal("implicit registry, namespace and tag must not change the identity")
+	}
+	if CanonicalRef("app:1") == CanonicalRef("app:2") {
+		t.Fatal("different tags are different images")
+	}
+}

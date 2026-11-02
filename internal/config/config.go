@@ -25,6 +25,7 @@ type Config struct {
 	HostName      string        // name of the Docker host shown in notifications; empty asks the Docker daemon
 	HealthWait    time.Duration // how long a new container is observed before the update is accepted; 0 disables the gate
 	HealthCheck   bool          // probe the local web server's /healthz and exit (used by the image HEALTHCHECK)
+	UpdateToken   string        // bearer token of POST /api/update; empty disables that endpoint
 }
 
 func envOr(getenv func(string) string, key, def string) string {
@@ -43,7 +44,7 @@ const maxHealthWaitSeconds = 600
 // flags holds the parsed values of every setting, before validation.
 type flags struct {
 	interval, token, chat, dry, web, addr, state, sock, dockerCfg, healthWait, cleanup *string
-	hostName                                                                           *string
+	hostName, updateToken                                                              *string
 	healthcheck                                                                        *bool
 }
 
@@ -64,6 +65,7 @@ func newFlagSet(getenv func(string) string) (*flag.FlagSet, flags) {
 		hostName:    fs.String("host-name", getenv("HOST_NAME"), "host name shown in notifications, for example the full FQDN; defaults to the name reported by the Docker daemon (env HOST_NAME)"),
 		healthWait:  fs.String("health-wait", envOr(getenv, "HEALTH_WAIT_SECONDS", "60"), "seconds a new container is watched before the update is accepted, 0 disables the check, 0 to 600 (env HEALTH_WAIT_SECONDS)"),
 		cleanup:     fs.String("cleanup-images", envOr(getenv, "CLEANUP_IMAGES", "false"), "remove the previous image after a successful update (env CLEANUP_IMAGES)"),
+		updateToken: fs.String("update-token", getenv("UPDATE_API_TOKEN"), "bearer token that allows POST /api/update to update the containers of an image; the endpoint is disabled when empty, needs the web server (env UPDATE_API_TOKEN)"),
 		healthcheck: fs.Bool("healthcheck", false, "probe the local web server's /healthz, exit 0 when healthy (or when the web server is disabled) and 1 otherwise; used by the image HEALTHCHECK"),
 	}
 }
@@ -113,6 +115,10 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if webEnabled && strings.TrimSpace(*addr) == "" {
 		return Config{}, fmt.Errorf("WEB_ADDR must not be empty when the web server is enabled")
 	}
+	updateToken := strings.TrimSpace(*f.updateToken)
+	if updateToken != "" && !webEnabled {
+		return Config{}, fmt.Errorf("UPDATE_API_TOKEN needs WEB_ENABLED=true: the update endpoint is served by the web server")
+	}
 	return Config{
 		Interval:      time.Duration(minutes) * time.Minute,
 		TelegramToken: *token,
@@ -127,5 +133,6 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		HealthWait:    time.Duration(wait) * time.Second,
 		CleanupImages: cleanupImages,
 		HealthCheck:   *f.healthcheck,
+		UpdateToken:   updateToken,
 	}, nil
 }

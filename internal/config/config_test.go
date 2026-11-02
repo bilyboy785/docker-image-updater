@@ -48,7 +48,7 @@ func TestFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock", "/config", true, "", 45 * time.Second, false}
+	want := Config{5 * time.Minute, "tok", "42", true, true, "127.0.0.1:9000", "/data/state.json", "/tmp/d.sock", "/config", true, "", 45 * time.Second, false, ""}
 	if c != want {
 		t.Fatalf("got %+v want %+v", c, want)
 	}
@@ -166,5 +166,40 @@ func TestHostNameFlagOverridesEnv(t *testing.T) {
 	c, err = Load(nil, env(map[string]string{"HOST_NAME": "env.example.com"}))
 	if err != nil || c.HostName != "env.example.com" {
 		t.Fatalf("env: got %q, %v", c.HostName, err)
+	}
+}
+
+func TestUpdateTokenIsEmptyByDefault(t *testing.T) {
+	c, err := Load(nil, env(nil))
+	if err != nil || c.UpdateToken != "" {
+		t.Fatalf("%v %+v", err, c)
+	}
+}
+
+func TestUpdateTokenFromEnvAndFlag(t *testing.T) {
+	c, err := Load(nil, env(map[string]string{"UPDATE_API_TOKEN": "  from-env \n", "WEB_ENABLED": "true"}))
+	if err != nil || c.UpdateToken != "from-env" {
+		t.Fatalf("%v %+v", err, c)
+	}
+	c, err = Load([]string{"-update-token", "from-flag"}, env(map[string]string{"UPDATE_API_TOKEN": "from-env", "WEB_ENABLED": "true"}))
+	if err != nil || c.UpdateToken != "from-flag" {
+		t.Fatalf("%v %+v", err, c)
+	}
+}
+
+func TestUpdateTokenNeedsTheWebServer(t *testing.T) {
+	_, err := Load(nil, env(map[string]string{"UPDATE_API_TOKEN": "secret"}))
+	if err == nil || !strings.Contains(err.Error(), "WEB_ENABLED") {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := Load(nil, env(map[string]string{"UPDATE_API_TOKEN": "   "})); err != nil {
+		t.Fatalf("a blank token means disabled, not an error: %v", err)
+	}
+}
+
+func TestUsageMentionsTheUpdateToken(t *testing.T) {
+	u := Usage()
+	if !strings.Contains(u, "-update-token") || !strings.Contains(u, "UPDATE_API_TOKEN") {
+		t.Fatal(u)
 	}
 }

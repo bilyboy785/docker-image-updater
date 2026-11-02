@@ -96,6 +96,9 @@ type Option func(*options)
 type options struct {
 	now      func() time.Time
 	interval time.Duration // scan interval used by the /healthz staleness rule; 0 disables the rule
+
+	updateToken string    // bearer token of POST /api/update; empty disables the endpoint
+	update      UpdateAPI // what POST /api/update calls
 }
 
 // WithHealth makes /healthz report 503 when the scan loop looks dead: no scan completed within
@@ -114,7 +117,7 @@ func WithClock(now func() time.Time) Option {
 }
 
 // Handler returns the HTTP handler serving the page (/), the JSON statistics (/api/stats), the
-// Prometheus metrics (/metrics), /healthz and POST /api/scan, which asks for an immediate scan
+// Prometheus metrics (/metrics), /healthz, POST /api/update (see WithUpdateAPI) and POST /api/scan, which asks for an immediate scan
 // through trigger (answers 501 when trigger is nil). With ?container=<name> the scan only covers that
 // container, which must be in the container list of snap (404 otherwise, 400 for a malformed name).
 func Handler(snap func() stats.Snapshot, trigger func(ScanRequest) ScanResult, opts ...Option) http.Handler {
@@ -204,6 +207,7 @@ func Handler(snap func() stats.Snapshot, trigger func(ScanRequest) ScanResult, o
 			writeError(w, http.StatusTooManyRequests, "last scan started too recently, retry later")
 		}
 	})
+	mux.HandleFunc("POST /api/update", o.handleUpdate)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")

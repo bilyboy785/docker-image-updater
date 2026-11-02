@@ -16,6 +16,9 @@ const DefaultMinSpacing = 30 * time.Second
 // triggered scan of a single container.
 const DefaultTargetedSpacing = 5 * time.Second
 
+// maxPendingImages caps the number of distinct images waiting for an image scan.
+const maxPendingImages = 64
+
 // TriggerStatus is the outcome of a manual scan request.
 type TriggerStatus int
 
@@ -26,6 +29,10 @@ const (
 	AlreadyRunning
 	// TooSoon means the previous scan started less than the minimum spacing ago.
 	TooSoon
+	// Queued means an image request was accepted: it is served as soon as the scan in progress, if any, ends.
+	Queued
+	// QueueFull means too many distinct images are already waiting for a scan.
+	QueueFull
 )
 
 // TriggerResult is returned by Scheduler.Trigger. RetryAfter is only set for TooSoon.
@@ -34,9 +41,11 @@ type TriggerResult struct {
 	RetryAfter time.Duration
 }
 
-// request is what the goroutine running Run is asked to scan: everything, or one container.
+// request is what the goroutine running Run is asked to scan: everything, one container, or the
+// containers running one image (image is then set, and targeted too).
 type request struct {
 	container string
+	image     string
 	targeted  bool
 }
 
@@ -50,6 +59,7 @@ type request struct {
 type Scheduler struct {
 	run         func(context.Context) error
 	runOne      func(context.Context, string) error
+	runImage    func(context.Context, string) error
 	interval    time.Duration
 	minSpacing  time.Duration
 	oneSpacing  time.Duration
@@ -62,6 +72,8 @@ type Scheduler struct {
 	running   bool
 	lastStart time.Time
 	trigger   chan request
+	pending   []string      // images waiting for an image scan, in arrival order, without duplicates
+	imageWake chan struct{} // holds a value exactly when pending is not empty
 }
 
 // NewScheduler returns a scheduler calling run for every scan.
@@ -77,6 +89,8 @@ func NewScheduler(run func(context.Context) error, interval time.Duration, log *
 		onScanning:  func(bool) {},
 		onScheduled: func(time.Time) {},
 		trigger:     make(chan request, 1),
+		imageWake:   make(chan struct{}, 1),
+		runImage:    func(context.Context, string) error { return errors.New("scanning one image is not supported") },
 	}
 }
 
@@ -94,6 +108,13 @@ func (s *Scheduler) WithContainerRun(runOne func(context.Context, string) error)
 	return s
 }
 
+// WithImageRun sets the function updating the containers of one image, used by TriggerImage.
+// It must be called before Run.
+func (s *Scheduler) WithImageRun(runImage func(context.Context, string) error) *Scheduler {
+	s.runImage = runImage
+	return s
+}
+
 // Trigger asks for an immediate full scan without blocking. It is safe for concurrent use and only
 // signals the goroutine running Run, it never runs a scan itself.
 func (s *Scheduler) Trigger() TriggerResult {
@@ -104,6 +125,48 @@ func (s *Scheduler) Trigger() TriggerResult {
 // as Trigger. The periodic schedule is not moved by that scan.
 func (s *Scheduler) TriggerContainer(name string) TriggerResult {
 	return s.request(request{container: name, targeted: true}, s.oneSpacing)
+}
+
+// TriggerImage asks for the containers running ref to be updated, without blocking. Unlike the manual
+// scans it is never refused because of the spacing or because a scan is running: the request waits for its
+// turn, so that a burst of pushes is served entirely. A request for an image already waiting is merged into
+// it, since the scan will pull the newest version anyway. The periodic schedule is not moved. ref is
+// compared as is, pass it through registry.CanonicalRef first.
+func (s *Scheduler) TriggerImage(ref string) TriggerResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.pending {
+		if p == ref {
+			return TriggerResult{Status: Queued}
+		}
+	}
+	if len(s.pending) >= maxPendingImages {
+		return TriggerResult{Status: QueueFull}
+	}
+	s.pending = append(s.pending, ref)
+	select {
+	case s.imageWake <- struct{}{}:
+	default:
+	}
+	return TriggerResult{Status: Queued}
+}
+
+// popImage removes and returns the image waiting the longest.
+func (s *Scheduler) popImage() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.pending) == 0 {
+		return "", false
+	}
+	ref := s.pending[0]
+	s.pending = append([]string(nil), s.pending[1:]...)
+	if len(s.pending) == 0 {
+		select { // keep imageWake set only while something is pending
+		case <-s.imageWake:
+		default:
+		}
+	}
+	return ref, true
 }
 
 func (s *Scheduler) request(req request, spacing time.Duration) TriggerResult {
@@ -125,8 +188,10 @@ func (s *Scheduler) request(req request, spacing time.Duration) TriggerResult {
 	return TriggerResult{Status: Started}
 }
 
-// begin marks a scan as running (it may already be, when a trigger was accepted).
-func (s *Scheduler) begin() {
+// begin marks a scan as running (it may already be, when a trigger was accepted). dropPending tells
+// whether the scan serves the manual request that may be waiting: not the case of an image scan, which
+// only covers its own image.
+func (s *Scheduler) begin(dropPending bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.running {
@@ -135,9 +200,11 @@ func (s *Scheduler) begin() {
 	}
 	// A request accepted at the same time as a periodic scan is served by that scan: a full scan covers
 	// the targeted container too, and the request must not run a second scan right after.
-	select {
-	case <-s.trigger:
-	default:
+	if dropPending {
+		select {
+		case <-s.trigger:
+		default:
+		}
 	}
 }
 
@@ -149,12 +216,15 @@ func (s *Scheduler) end() {
 
 // scan runs one scan; the running state and the scanning flag are always reset, even if run panics.
 func (s *Scheduler) scan(ctx context.Context, req request) error {
-	s.begin()
+	s.begin(req.image == "")
 	s.onScanning(true)
 	defer func() {
 		s.onScanning(false)
 		s.end()
 	}()
+	if req.image != "" {
+		return s.runImage(ctx, req.image)
+	}
 	if req.targeted {
 		return s.runOne(ctx, req.container)
 	}
@@ -191,13 +261,23 @@ func (s *Scheduler) Run(ctx context.Context) {
 			s.log.Info("shutting down")
 			return
 		}
-		select {
-		case <-ctx.Done():
-			s.log.Info("shutting down")
-			return
-		case <-timer.C:
-			req = request{}
-		case req = <-s.trigger:
+	wait:
+		for {
+			if ref, ok := s.popImage(); ok { // an explicit request for an image comes first
+				req = request{image: ref, targeted: true}
+				break wait
+			}
+			select {
+			case <-ctx.Done():
+				s.log.Info("shutting down")
+				return
+			case <-timer.C:
+				req = request{}
+				break wait
+			case req = <-s.trigger:
+				break wait
+			case <-s.imageWake: // popImage picks the request up on the next turn
+			}
 		}
 	}
 }

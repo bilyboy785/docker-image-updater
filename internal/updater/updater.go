@@ -14,6 +14,7 @@ import (
 
 	"github.com/bilyboy785/docker-image-updater/internal/docker"
 	"github.com/bilyboy785/docker-image-updater/internal/notify"
+	"github.com/bilyboy785/docker-image-updater/internal/registry"
 	"github.com/bilyboy785/docker-image-updater/internal/stats"
 )
 
@@ -76,8 +77,17 @@ type Updater struct {
 	hsleep     func(ctx context.Context, d time.Duration)
 
 	report  map[string]stats.ContainerStatus // per-scan container list, by container name
-	partial bool                             // the current scan covers a single container: its report is merged into the published list
+	partial bool                             // the current scan covers part of the containers: its report is merged into the published list
+	force   bool                             // the current scan was explicitly requested for an image: update windows and the notify policy do not apply
 }
+
+// scope selects what a scan looks at. The zero value is a full scan.
+type scope struct {
+	container string // only the container with that name
+	image     string // only the containers running that image, as returned by registry.CanonicalRef; the update is forced
+}
+
+func (sc scope) partial() bool { return sc.container != "" || sc.image != "" }
 
 // ErrContainerNotFound is returned by RunContainer when no running container has the requested name.
 var ErrContainerNotFound = errors.New("container not found")
@@ -185,7 +195,18 @@ func (u *Updater) publishReport() {
 
 // RunOnce performs one full scan.
 func (u *Updater) RunOnce(ctx context.Context) error {
-	return u.scan(ctx, "", false)
+	return u.scan(ctx, scope{})
+}
+
+// RunImage updates the running containers whose image is ref (compared by registry.CanonicalRef, so
+// "app" and "docker.io/library/app:latest" are the same image) and nothing else. The update was asked
+// for explicitly, so it is forced: the update windows and the notify policy of those containers are
+// ignored. Everything else still applies: the opt-out label, digest pins, locally built images, invalid
+// labels, AutoRemove, dry-run, the updater's own container, the health gate with rollback, image
+// cleanup, notifications and events. Like RunContainer, it merges its report into the published list and
+// does not change the watched/skipped gauges. No matching container is not an error.
+func (u *Updater) RunImage(ctx context.Context, ref string) error {
+	return u.scan(ctx, scope{image: registry.CanonicalRef(ref)})
 }
 
 // RunContainer scans the running container called name and nothing else: the same checks, pull, policies,
@@ -194,13 +215,48 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 // watched/skipped gauges are not changed. When no running container has that name, ErrContainerNotFound is
 // returned, no scan is recorded and the stale entry of that name is removed from the published list.
 func (u *Updater) RunContainer(ctx context.Context, name string) error {
-	return u.scan(ctx, name, true)
+	return u.scan(ctx, scope{container: name})
 }
 
-// scan lists the running containers and checks them all, or only the one called only when partial is set.
-func (u *Updater) scan(ctx context.Context, only string, partial bool) error {
+// runningImage returns the containers of all that run image (as returned by registry.CanonicalRef).
+func (u *Updater) runningImage(ctx context.Context, all []docker.Container, image string) []docker.Container {
+	var out []docker.Container
+	for _, c := range all {
+		ref := c.Image
+		if bareID.MatchString(ref) {
+			ref = u.configImage(ctx, c.ID) // the tag moved: recover the reference the container was created with
+		}
+		if ref != "" && registry.CanonicalRef(ref) == image {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// ContainersOfImage returns the names of the running containers that use ref, whatever their labels
+// (those opted out or pinned are listed too, they are only left alone by the update). It asks Docker, so
+// it also sees containers started since the last scan, and it is safe to call while a scan runs.
+func (u *Updater) ContainersOfImage(ctx context.Context, ref string) ([]string, error) {
+	lctx, cancel := context.WithTimeout(ctx, u.apiTimeout)
+	all, err := u.docker.ListContainers(lctx)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("list containers: %w", err)
+	}
+	var names []string
+	for _, c := range u.runningImage(ctx, all, registry.CanonicalRef(ref)) {
+		names = append(names, c.Name())
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// scan lists the running containers and checks them all, or only those selected by sc.
+func (u *Updater) scan(ctx context.Context, sc scope) error {
 	start := time.Now()
+	only, partial := sc.container, sc.partial()
 	u.partial = partial
+	u.force = sc.image != ""
 	u.report = map[string]stats.ContainerStatus{}
 	lctx, lcancel := context.WithTimeout(ctx, u.apiTimeout)
 	containers, err := u.docker.ListContainers(lctx)
@@ -210,7 +266,8 @@ func (u *Updater) scan(ctx context.Context, only string, partial bool) error {
 	}
 	u.touch() // only a scan that can reach the daemon makes progress
 	all := containers
-	if partial {
+	switch {
+	case sc.container != "":
 		containers = nil
 		for _, c := range all {
 			if c.Name() == only {
@@ -222,6 +279,8 @@ func (u *Updater) scan(ctx context.Context, only string, partial bool) error {
 			u.stats.RemoveContainer(only) // it no longer exists: do not keep a stale row
 			return fmt.Errorf("%w: %q", ErrContainerNotFound, only)
 		}
+	case sc.image != "":
+		containers = u.runningImage(ctx, all, sc.image)
 	}
 	groups := map[string][]docker.Container{}
 	var refs []string
@@ -491,12 +550,12 @@ func (u *Updater) handle(ctx context.Context, c docker.Container, ref, newID str
 		}
 		return
 	}
-	if pol.Notify {
+	if pol.Notify && !u.force {
 		u.announceAvailable(ctx, ev, c, newID, "\n(policy: notify) The update is not applied automatically.")
 		u.note(c, ref, stats.ContainerUpdateAvailable, "policy: notify")
 		return
 	}
-	if !pol.InWindow(u.now().In(time.Local)) {
+	if !u.force && !pol.InWindow(u.now().In(time.Local)) {
 		u.log.Debug("outside the update window, postponing", "container", ev.Container, "window", c.Labels[WindowLabel])
 		u.note(c, ref, stats.ContainerWaitingWindow, "outside the update window "+c.Labels[WindowLabel])
 		return

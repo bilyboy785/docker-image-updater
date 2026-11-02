@@ -40,6 +40,29 @@ func RegistryHost(ref string) string {
 	return hubHost
 }
 
+// CanonicalRef returns the fully qualified form of an image reference, so that two spellings of the
+// same image compare equal: the registry host is lowercased and spelled out ("docker.io" for every
+// Docker Hub name, with the implicit "library/" namespace of official images) and a missing tag
+// becomes ":latest". A digest, if any, is left untouched.
+func CanonicalRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	host, rest := hubHost, ref
+	if first, r, found := strings.Cut(ref, "/"); found && (strings.ContainsAny(first, ".:") || first == "localhost") {
+		host, rest = normalize(first), r
+	}
+	if host == hubHost && !strings.Contains(rest, "/") {
+		rest = "library/" + rest
+	}
+	if name, _, _ := strings.Cut(rest, "@"); !strings.Contains(name[strings.LastIndex(name, "/")+1:], ":") {
+		if i := strings.Index(rest, "@"); i >= 0 {
+			rest = rest[:i] + ":latest" + rest[i:]
+		} else {
+			rest += ":latest"
+		}
+	}
+	return host + "/" + rest
+}
+
 // normalize reduces a config key or registry host to a comparable host: no scheme, no path,
 // lower case, and every Docker Hub name folded into "docker.io".
 func normalize(s string) string {

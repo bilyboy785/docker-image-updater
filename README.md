@@ -18,6 +18,7 @@ Keeps your running Docker containers up to date: it pulls fresh images on a sche
 - Optional statistics dashboard with the status of every container and buttons to force a scan, of everything or of a single container.
 - Prometheus metrics (`/metrics`), a liveness endpoint (`/healthz`) and a built-in image `HEALTHCHECK`.
 - Per-container opt-out label, update policy (`auto` or `notify`) and update time windows.
+- Optional authenticated HTTP endpoint to update, right away, the containers running an image your build pipeline just pushed. See [Updating an image on demand](#updating-an-image-on-demand).
 - Locally built images are ignored silently.
 - Dry-run mode: only notify, never recreate.
 - Post-start health gate: the update is only kept once the new container proves it works, otherwise it is rolled back.
@@ -78,6 +79,7 @@ Every setting can be given as an environment variable or as a command-line flag.
 | `WEB_ADDR`               | `-web-addr`        | `:8080`                 | Listen address of the web server. |
 | `STATE_FILE`             | `-state-file`      | empty                   | File used to persist statistics across restarts. Statistics are not persisted when empty. |
 | `HOST_NAME`              | `-host-name`       | empty                   | Host name shown in the title of notifications, lowercased. Use it to get the full FQDN. When empty, the name reported by the Docker daemon is used. |
+| `UPDATE_API_TOKEN`       | `-update-token`    | empty                   | Bearer token of `POST /api/update`. The endpoint is disabled when empty, and the token requires `WEB_ENABLED=true`. See [Updating an image on demand](#updating-an-image-on-demand). |
 | `DOCKER_SOCKET`          | `-socket`          | `/var/run/docker.sock`  | Path of the Docker socket. |
 | `HEALTH_WAIT_SECONDS`    | `-health-wait`     | `60`                    | How long a new container is watched before the update is accepted, in seconds (integer from 0 to 600). `0` disables the health gate. See [Health gate](#health-gate). |
 | `CLEANUP_IMAGES`         | `-cleanup-images`  | `false`                 | Remove the previous image after a successful update. See [Cleaning up old images](#cleaning-up-old-images). |
@@ -431,11 +433,49 @@ The targeted scan runs exactly the same checks as a full scan for that container
 
 A targeted scan counts in `scans`, `last_scan` and the duration, but it does not move the periodic schedule (a full forced scan does), and it replaces only the entry of that container in the container list: the other entries keep their status and their last check time. The `watched` and `skipped` gauges describe whole scans and keep their previous values after a targeted scan.
 
+### Updating an image on demand
+
+When a pipeline builds and pushes an image, it can ask the updater to update the containers running it at once, instead of waiting for the next scan. This endpoint is disabled by default: set `UPDATE_API_TOKEN` (it needs `WEB_ENABLED=true`) to enable it.
+
+```bash
+curl -X POST -H "Authorization: Bearer $UPDATE_API_TOKEN" \
+  --get --data-urlencode 'image=registry.example.com/my-app:latest' \
+  http://127.0.0.1:8080/api/update
+```
+
+The call returns `202` at once, before anything is pulled or recreated:
+
+```json
+{"status":"queued","image":"registry.example.com/my-app:latest","containers":["my-app","my-app-worker"]}
+```
+
+The update itself runs in the background, with the pull, the health gate, the rollback, the notifications and the events of a normal scan. Read the outcome in the notifications, in `/api/stats` or in the logs.
+
+- **Image reference.** It is matched against the image of every running container once spelled out in full: `my-app` and `docker.io/library/my-app:latest` are the same image, a missing tag means `:latest`, and the registry host is case-insensitive. A reference with a digest (`@sha256:...`) is a `400`: containers pinned by digest are never updated.
+- **Containers.** `containers` lists every running container that uses the image, asked to Docker at the time of the call (so a container started since the last scan is found). Containers opted out or pinned are listed too, they are only left alone by the update.
+- **Forced update.** The request is explicit, so the update windows (`docker-image-updater.window`) and the `notify` policy of those containers are ignored. Everything else still applies: the opt-out label (`enable=false`), digest pins, locally built images, invalid labels, `AutoRemove` containers, `DRY_RUN`, the updater's own container, the health gate and its rollback, and image cleanup. The next scheduled scan still applies windows and policies as usual.
+- **Queue.** A request is never refused because a scan is running or because another one just ran: it waits for its turn, so a pipeline that pushes several images in a row has all of them served. Requests for an image that is already waiting are merged (the scan pulls the newest version anyway), and at most 64 different images wait at the same time. The periodic schedule is not moved.
+- **Statistics.** Like a scan of one container, it counts in `scans` and replaces only the entries of its containers in the container list; the `watched` and `skipped` gauges keep their value.
+
+| Answer | Meaning |
+|--------|---------|
+| `202` | Accepted and queued. |
+| `400` | The `image` parameter is missing, given several times, or not a valid reference without digest. |
+| `401` | The `Authorization: Bearer <token>` header is missing or wrong (`WWW-Authenticate: Bearer`). The token is only read from this header, never from the URL. |
+| `404` | No running container uses this image. |
+| `405` | The method is not `POST`. |
+| `501` | `UPDATE_API_TOKEN` is not set. |
+| `502` | The Docker daemon could not be asked for the running containers. |
+| `503` | 64 images are already waiting: retry after the `Retry-After` delay. |
+
+The token is compared in constant time and is never logged. Unlike the dashboard buttons, this endpoint does not use the `X-Requested-With` header: the bearer token is the credential. It still goes over plain HTTP, so keep the port on a private network or behind a reverse proxy that terminates TLS (a leaked token lets anyone make the updater pull and recreate the containers of any image they know the name of, within the rules above). Use a long random value, for example `openssl rand -hex 32`, and pass it from a secret rather than a literal in the compose file.
+
 ## Security considerations
 
 - Mounting `/var/run/docker.sock` gives the container root-equivalent access to the host. Only run images you trust.
 - Because of this, the image runs as root.
 - Keep the web port private (see above).
+- `POST /api/update` is the only endpoint protected by a credential, and it can make the updater recreate containers: treat `UPDATE_API_TOKEN` like a deployment secret.
 
 ### Verifying images
 
